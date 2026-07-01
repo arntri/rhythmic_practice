@@ -72,9 +72,3 @@ local-only with the cloud disabled.
 > The publishable key is designed to be embedded in client apps; it only grants
 > the access the database's row-level-security policies allow (see
 > `supabase/migrations/`).
-
-
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
