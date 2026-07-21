@@ -6,6 +6,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
+import 'package:rhythmic_practice/practice/practice_controller.dart';
 import 'package:rhythmic_practice/services/audio_eviction.dart';
 
 void main() {
@@ -88,6 +89,42 @@ void main() {
     expect(recent.localEncryptedAudioPath, isNotNull);
   });
 
+  test('eviction never deletes guide clips — starter guides survive (Part 3)',
+      () async {
+    // The 48h eviction forgets patient ATTEMPT audio only. A starter word's
+    // bundled guide lives in practice_phrases.guide_clip_path (like any recorded
+    // guide) and must never be collateral — starters stay usable forever.
+    final starter = (await db.query('practice_phrases',
+            where: 'is_starter = 1', limit: 1))
+        .first;
+    final starterId = starter['phrase_id'] as int;
+    final guideFile = File('${tmp.path}/starter_guide.enc');
+    await guideFile.writeAsString('encrypted starter guide');
+    await repo.attachGuideClipPath(starterId, guideFile.path);
+
+    // An old attempt (with audio) that IS eligible for eviction.
+    final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
+    final attemptFile = await seedAttemptWithAudio(
+      sessionId: sessionId,
+      phraseId: starterId,
+      name: 'old-attempt',
+      timestampUtc: '2019-12-30 12:00:00', // > 48h ago
+    );
+
+    final evicted =
+        await AudioEvictionService(repo).evictExpired(now: DateTime.utc(2020, 1, 3));
+
+    // The attempt audio was wiped...
+    expect(evicted, 1);
+    expect(attemptFile.existsSync(), isFalse);
+    // ...but the starter's guide clip (file + DB pointer) is fully intact.
+    expect(guideFile.existsSync(), isTrue);
+    final refreshed = (await db.query('practice_phrases',
+            where: 'phrase_id = ?', whereArgs: [starterId]))
+        .single;
+    expect(refreshed['guide_clip_path'], guideFile.path);
+  });
+
   test('a missing file does not stop the path from being cleared', () async {
     final phraseId = (await repo.getActivePhrases()).first.phraseId;
     final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
@@ -143,5 +180,62 @@ void main() {
     expect(anchor, isNotNull);
     expect(anchor!.scoreVsReference, closeTo(0.7, 1e-9));
     expect(anchor.mfcc.single, orderedEquals([1.0, 2.0, 3.0, 4.0]));
+  });
+
+  test('eviction keeps derived per-attempt data — feature vector + taps (item 23)',
+      () async {
+    // The 48h eviction must forget ONLY the raw audio. The onset stream and the
+    // raw tap stream are derived, non-audio features kept for later ML; they must
+    // survive even after the source clip is wiped.
+    final phraseId = (await repo.getActivePhrases()).first.phraseId;
+    final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
+
+    final oldFile = await seedAttemptWithAudio(
+      sessionId: sessionId,
+      phraseId: phraseId,
+      name: 'derived',
+      timestampUtc: '2019-12-30 12:00:00', // > 48h ago
+    );
+
+    // A derived feature vector with the patient's detected onsets...
+    await db.insert('acoustic_feature_vectors', {
+      'vector_id': 'v-derived',
+      'attempt_id': 'derived',
+      'content_similarity_score': 0.82,
+      'mfcc_distance': 0.4,
+      'gate_passed': 1,
+      'gate_reason': 'ok',
+      'duration_ms': 900,
+      'onset_ms': '0,410,820',
+    });
+    // ...and the raw tap stream.
+    await repo.insertTapEvents(
+      attemptId: 'derived',
+      phraseId: phraseId,
+      sessionId: sessionId,
+      rung: 4,
+      taps: [
+        TapEvent(downMs: 100, phase: 0.0, dwellMs: 80),
+        TapEvent(downMs: 620, phase: 0.3, dwellMs: 75),
+      ],
+    );
+
+    final service = AudioEvictionService(repo);
+    final evicted = await service.evictExpired(now: DateTime.utc(2020, 1, 3));
+
+    // Audio gone + path nulled...
+    expect(evicted, 1);
+    expect(oldFile.existsSync(), isFalse);
+    final attempt = (await repo.getAttemptsForSession(sessionId)).single;
+    expect(attempt.localEncryptedAudioPath, isNull);
+
+    // ...but the derived data is fully intact.
+    final fv = await repo.getFeatureVector('derived');
+    expect(fv, isNotNull);
+    expect(fv!.contentSimilarityScore, closeTo(0.82, 1e-9));
+    expect(fv.onsetMs, orderedEquals([0, 410, 820]));
+    final taps = await repo.getTapEvents('derived');
+    expect(taps, hasLength(2));
+    expect(taps.map((t) => t.downMs), orderedEquals([100, 620]));
   });
 }

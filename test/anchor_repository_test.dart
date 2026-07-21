@@ -52,6 +52,7 @@ void main() {
         gatePassed: true,
         gateReason: 'ok',
         contentSimilarityScore: 0.83,
+        mfccDistance: 0.21,
         durationMs: 1200,
         mfcc: [],
       );
@@ -62,6 +63,7 @@ void main() {
       expect(fv!.gatePassed, isTrue);
       expect(fv.gateReason, 'ok');
       expect(fv.contentSimilarityScore, closeTo(0.83, 1e-9));
+      expect(fv.mfccDistance, closeTo(0.21, 1e-9)); // item 16b: raw distance kept
       expect(fv.durationMs, 1200);
     });
 
@@ -71,6 +73,7 @@ void main() {
         gatePassed: false,
         gateReason: 'too_quiet',
         contentSimilarityScore: null,
+        mfccDistance: null,
         durationMs: 500,
         mfcc: [],
       );
@@ -80,6 +83,29 @@ void main() {
       expect(fv!.gatePassed, isFalse);
       expect(fv.gateReason, 'too_quiet');
       expect(fv.contentSimilarityScore, isNull);
+      expect(fv.mfccDistance, isNull); // no distance without a passed clip/template
+      expect(fv.onsetMs, isEmpty);
+    });
+
+    test('patient onsets round-trip through the feature vector (item 16c)',
+        () async {
+      final attemptId = await attempt(1);
+      const result = AnalysisResult(
+        gatePassed: true,
+        gateReason: 'ok',
+        contentSimilarityScore: 0.9,
+        mfccDistance: 0.11,
+        durationMs: 1500,
+        mfcc: [],
+      );
+      await repo.insertFeatureVector(
+        attemptId: attemptId,
+        result: result,
+        onsetMs: const [120, 640, 1180],
+      );
+
+      final fv = await repo.getFeatureVector(attemptId);
+      expect(fv!.onsetMs, [120, 640, 1180]); // CSV survives the round-trip
     });
   });
 

@@ -28,13 +28,30 @@ void main() {
     expect(profiles.first['profile_id'], AppDatabase.defaultProfileId);
     expect(profiles.first['metronome_bpm'], 60);
 
-    // All 13 starter phrases were inserted; only the 5 level-1 words start
-    // active, so a first session is short and intentional (UX overhaul).
+    // 15 generic seed phrases (is_starter = 0) + the 10-word starter library
+    // (is_starter = 1, Part 3) = 25 rows.
     final phrases = await db.query('practice_phrases');
-    expect(phrases.length, 13);
+    expect(phrases.length, 25);
+    final generic =
+        await db.query('practice_phrases', where: 'is_starter = 0');
+    expect(generic.length, 15);
+    final starters =
+        await db.query('practice_phrases', where: 'is_starter = 1');
+    expect(starters.length, 10);
 
+    // 5 single-syllable generic words start active + 4 starter essentials
+    // (Water/Hello/Yes/No) = 9, so a first session is short and intentional.
     final active = await db.query('practice_phrases', where: 'is_active = 1');
-    expect(active.length, 5);
+    expect(active.length, 9);
+
+    // complexity_level is derived from syllable_count (item 12): the seeded
+    // longer phrases are L2 (4–6 syllables) and L3 (7+).
+    final l2 = await db.query('practice_phrases',
+        where: 'phrase_text = ?', whereArgs: ['Can you help me']);
+    expect(l2.single['complexity_level'], 2);
+    final l3 = await db.query('practice_phrases',
+        where: 'phrase_text = ?', whereArgs: ['I would like to go home now']);
+    expect(l3.single['complexity_level'], 3);
 
     // The other two tables exist and start empty.
     expect((await db.query('practice_sessions')).length, 0);

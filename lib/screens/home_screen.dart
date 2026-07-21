@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app/orientation.dart';
 import '../data/practice_repository.dart';
 import '../theme.dart';
 import 'account_screen.dart';
@@ -53,7 +54,7 @@ class _HomeScreenState extends State<HomeScreen>
     try {
       final profile = await _repo.getProfile();
       if (profile.onboardingSeen || !mounted) return;
-      await Navigator.of(context).push(MaterialPageRoute(
+      await Navigator.of(context).push(PortraitPageRoute(
           builder: (_) => const HelpScreen(isOnboarding: true)));
       await _repo.updateProfile(onboardingSeen: true);
     } catch (_) {
@@ -62,20 +63,22 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _startPractice() {
+    // Patient practice surface — landscape.
     Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const PracticeScreen()),
+      LandscapePageRoute(builder: (_) => const PracticeScreen()),
     );
   }
 
   void _openHelp() {
     Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const HelpScreen()),
+      PortraitPageRoute(builder: (_) => const HelpScreen()),
     );
   }
 
+  // Every menu destination is a caregiver page → portrait.
   Future<void> _push(Widget screen) async {
     Navigator.of(context).pop(); // close the menu sheet
-    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
+    await Navigator.of(context).push(PortraitPageRoute(builder: (_) => screen));
   }
 
   // Open the guide-recording flow for any active phrases still missing a guide.
@@ -88,7 +91,7 @@ class _HomeScreenState extends State<HomeScreen>
           content: Text('Every active word already has a recorded guide.')));
       return;
     }
-    await Navigator.of(context).push(MaterialPageRoute(
+    await Navigator.of(context).push(PortraitPageRoute(
         builder: (_) => GuideRecordingScreen(phrases: phrases)));
   }
 

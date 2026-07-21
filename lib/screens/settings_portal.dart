@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app/orientation.dart';
 import '../data/models.dart';
 import '../data/practice_repository.dart';
 import '../practice/progression.dart';
@@ -47,6 +48,7 @@ class _SettingsPortalState extends State<SettingsPortal> {
   // Presenter "demo mode": shows the in-session level picker on the practice
   // screen for live demonstrations.
   late bool _demoMode;
+  late bool _soloMode;
   // Which phrase ids are currently active.
   final Set<int> _activeIds = {};
   final _newPhraseController = TextEditingController();
@@ -134,11 +136,61 @@ class _SettingsPortalState extends State<SettingsPortal> {
   // updates.
   Future<void> _recordGuide(PracticePhrase phrase) async {
     await Navigator.of(context).push(
-      MaterialPageRoute(
+      PortraitPageRoute(
         builder: (_) =>
             GuideRecordingScreen(phrases: [phrase], repository: _repo),
       ),
     );
+    if (mounted) await _load();
+  }
+
+  // Set/clear the R7 probe question for a phrase (audit item 11): the question the
+  // app plays for the user to answer with the phrase, solo. Cancel leaves it
+  // unchanged; Clear (or saving an empty box) removes it (R7 then uses a generic
+  // prompt). Text-only for now — a recorded probe clip can be added later.
+  Future<void> _editProbeQuestion(PracticePhrase phrase) async {
+    final controller =
+        TextEditingController(text: phrase.probeQuestionText ?? '');
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Answer-a-question step (R7)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+                'The app asks this; “${phrase.phraseText}” is the answer the '
+                'person gives on their own.'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: const InputDecoration(
+                hintText: 'e.g. “How are you feeling?”',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), // null → unchanged
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, ''), // '' → clear
+              child: const Text('Clear')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (result == null) return; // cancelled — no change
+    await _repo.setProbeQuestion(phrase.phraseId,
+        text: result.isEmpty ? null : result);
     if (mounted) await _load();
   }
 
@@ -160,6 +212,7 @@ class _SettingsPortalState extends State<SettingsPortal> {
       _playbackSpeed = profile.playbackSpeed;
       _rungCap = profile.sessionRungCap;
       _demoMode = profile.demoModeEnabled;
+      _soloMode = profile.soloModeEnabled;
       _activeIds
         ..clear()
         ..addAll(phrases.where((p) => p.isActive).map((p) => p.phraseId));
@@ -360,6 +413,23 @@ class _SettingsPortalState extends State<SettingsPortal> {
                 ),
 
                 const Divider(height: 32),
+                _sectionTitle('Experimental'),
+                SwitchListTile(
+                  title: const Text('Solo practice (experimental)'),
+                  subtitle: const Text(
+                    'Lets well-mastered words be practised solo, with the app '
+                    'giving light feedback. Still experimental: even when on, '
+                    'you confirm every verdict — the app never changes levels on '
+                    'its own. See Insights in History for what it would do.',
+                  ),
+                  value: _soloMode,
+                  onChanged: (v) {
+                    setState(() => _soloMode = v);
+                    _save(() => _repo.updateProfile(soloModeEnabled: v));
+                  },
+                ),
+
+                const Divider(height: 32),
                 _sectionTitle('Phrases'),
                 // Add a custom phrase (any language), then record its guide.
                 Row(
@@ -393,6 +463,7 @@ class _SettingsPortalState extends State<SettingsPortal> {
                             ? 'Guide recorded'
                             : 'No guide yet — tap the mic to record'),
                         _rungControl(phrase),
+                        _probeControl(phrase),
                       ],
                     ),
                     value: _activeIds.contains(phrase.phraseId),
@@ -481,6 +552,33 @@ class _SettingsPortalState extends State<SettingsPortal> {
         child: Text(text, style: Theme.of(context).textTheme.titleMedium),
       );
 
+  // The R7 probe-question line (audit item 11): shows the current question (or a
+  // prompt to add one) and opens the editor on tap.
+  Widget _probeControl(PracticePhrase phrase) {
+    final q = phrase.probeQuestionText;
+    return InkWell(
+      onTap: () => _editProbeQuestion(phrase),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          children: [
+            const Icon(Icons.help_outline, size: 16),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                q == null ? 'Set answer-a-question (R7)…' : 'Q: “$q”',
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                      fontStyle:
+                          q == null ? FontStyle.italic : FontStyle.normal,
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // Ease/regress the support rung for one phrase (therapy addendum §4).
   Widget _rungControl(PracticePhrase phrase) {
     final rung = phrase.rung;
@@ -490,8 +588,9 @@ class _SettingsPortalState extends State<SettingsPortal> {
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.chevron_left),
           tooltip: 'Easier',
-          onPressed:
-              rung == Rung.r0 ? null : () => _setRung(phrase, rung.lowered()),
+          onPressed: rung == entryRung
+              ? null
+              : () => _setRung(phrase, rung.loweredActive()),
         ),
         Expanded(
           child: Text('${rung.code} · ${rung.title}',
@@ -501,8 +600,9 @@ class _SettingsPortalState extends State<SettingsPortal> {
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.chevron_right),
           tooltip: 'Harder',
-          onPressed:
-              rung == Rung.r6 ? null : () => _setRung(phrase, rung.raised()),
+          onPressed: rung == topRung
+              ? null
+              : () => _setRung(phrase, rung.raisedActive()),
         ),
       ],
     );

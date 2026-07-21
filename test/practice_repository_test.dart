@@ -8,6 +8,7 @@ import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/models.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
 import 'package:rhythmic_practice/practice/mit_progression.dart';
+import 'package:rhythmic_practice/practice/practice_controller.dart';
 import 'package:rhythmic_practice/practice/progression.dart';
 
 void main() {
@@ -53,6 +54,177 @@ void main() {
     expect(a.latencyMs, isNull);
     expect(a.durationMs, isNull);
     expect(a.localEncryptedAudioPath, isNull);
+  });
+
+  test('persists and reads back the raw tap stream for an attempt', () async {
+    final phraseId = (await repo.getActivePhrases()).first.phraseId;
+    final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
+    final attemptId = await repo.insertAttempt(
+      sessionId: sessionId,
+      phraseId: phraseId,
+      evaluationLabel: 1,
+    );
+
+    await repo.insertTapEvents(
+      attemptId: attemptId,
+      phraseId: phraseId,
+      sessionId: sessionId,
+      rung: 4,
+      taps: [
+        TapEvent(downMs: 100, phase: 0.02, dwellMs: 55),
+        TapEvent(downMs: 640, phase: 0.30, dwellMs: 80),
+        TapEvent(downMs: 1180, phase: 0.10), // no release observed → dwell null
+      ],
+    );
+
+    final taps = await repo.getTapEvents(attemptId);
+    expect(taps.length, 3);
+    // Preserved order + fields, including the dwell that was never measured.
+    expect(taps.map((t) => t.tapIndex), [0, 1, 2]);
+    expect(taps[0].downMs, 100);
+    expect(taps[0].dwellMs, 55);
+    expect(taps[0].beatPhase, closeTo(0.02, 1e-9));
+    expect(taps[0].rung, 4);
+    expect(taps[2].dwellMs, isNull);
+
+    // The session read returns the same taps in chronological order.
+    final bySession = await repo.getTapEventsForSession(sessionId);
+    expect(bySession.map((t) => t.downMs), [100, 640, 1180]);
+  });
+
+  test('insertAttempt persists tempo_bpm as the beat reference (item 16c)',
+      () async {
+    final phraseId = (await repo.getActivePhrases()).first.phraseId;
+    final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
+    final attemptId = await repo.insertAttempt(
+      sessionId: sessionId,
+      phraseId: phraseId,
+      evaluationLabel: 1,
+      tempoBpm: 50,
+    );
+    final row = (await db.query('exercise_attempts',
+            where: 'attempt_id = ?', whereArgs: [attemptId]))
+        .single;
+    expect(row['tempo_bpm'], 50);
+  });
+
+  test('insertTapEvents is a no-op for an empty stream', () async {
+    final phraseId = (await repo.getActivePhrases()).first.phraseId;
+    final sessionId = await repo.createSession(AppDatabase.defaultProfileId);
+    final attemptId = await repo.insertAttempt(
+        sessionId: sessionId, phraseId: phraseId, evaluationLabel: 2);
+    await repo.insertTapEvents(
+      attemptId: attemptId,
+      phraseId: phraseId,
+      sessionId: sessionId,
+      rung: 0,
+      taps: const [],
+    );
+    expect(await repo.getTapEvents(attemptId), isEmpty);
+  });
+
+  test('setProbeQuestion round-trips on a phrase (R7, item 11)', () async {
+    final phrase = (await repo.getActivePhrases()).first;
+    expect(phrase.probeQuestionText, isNull); // none by default
+    await repo.setProbeQuestion(phrase.phraseId,
+        text: 'How are you feeling?', clipPath: 'clips/probe.enc');
+    final updated = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(updated.probeQuestionText, 'How are you feeling?');
+    expect(updated.probeQuestionClipPath, 'clips/probe.enc');
+    // Clearing sets both back to null.
+    await repo.setProbeQuestion(phrase.phraseId);
+    final cleared = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(cleared.probeQuestionText, isNull);
+    expect(cleared.probeQuestionClipPath, isNull);
+  });
+
+  test('default progression tier is seeded from syllable count (item 12)',
+      () async {
+    final all = await repo.getAllPhrases();
+    // A single-syllable starter word → Level 1.
+    final short = all.firstWhere((p) => p.phraseText == 'Help');
+    final shortState =
+        await repo.getProgressionState(AppDatabase.defaultProfileId, short.phraseId);
+    expect(shortState.syllableTier, 1);
+    // The seeded 7-syllable phrase → Level 3 by default (no stored row yet).
+    final long = all.firstWhere((p) => p.syllableCount >= 7);
+    final longState =
+        await repo.getProgressionState(AppDatabase.defaultProfileId, long.phraseId);
+    expect(longState.syllableTier, 3);
+    // A seeded 4-syllable phrase → Level 2.
+    final mid = all.firstWhere((p) => p.syllableCount == 4);
+    final midState =
+        await repo.getProgressionState(AppDatabase.defaultProfileId, mid.phraseId);
+    expect(midState.syllableTier, 2);
+  });
+
+  test('recording a guide starts an un-practised word at unison (R2)', () async {
+    final phrase = (await repo.getActivePhrases()).first; // an un-practised word
+    // Every word now enters at unison regardless of level (progression refactor).
+    await repo.setGuideClip(phrase.phraseId, 'guides/g.enc', 5,
+        nucleiMs: const [100, 300, 500, 700, 900]);
+    final l2 = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(l2.rung, Rung.r2);
+  });
+
+  test('re-recording a PROGRESSED word never resets its rung (item 13)',
+      () async {
+    final phrase = (await repo.getActivePhrases()).first;
+    // The word has been practised: a progression_state row exists at R6.
+    await repo.upsertProgressionState(ProgressionState(
+      profileId: AppDatabase.defaultProfileId,
+      phraseId: phrase.phraseId,
+      rung: Rung.r6,
+    ));
+    await repo.setRung(phrase.phraseId, Rung.r6);
+    // Re-recording a (now Level-2) guide must NOT drag it back to the entry rung.
+    await repo.setGuideClip(phrase.phraseId, 'guides/g2.enc', 5,
+        nucleiMs: const [100, 300, 500, 700, 900]);
+    final after = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(after.rung, Rung.r6); // progress preserved
+  });
+
+  test('setSprechgesangClip round-trips (item 15) and null clears it', () async {
+    final phrase = (await repo.getActivePhrases()).first;
+    expect(phrase.hasSprechgesangClip, isFalse); // none by default
+
+    await repo.setSprechgesangClip(phrase.phraseId, 'guides/slow.enc');
+    var after = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(after.sprechgesangClipPath, 'guides/slow.enc');
+    expect(after.hasSprechgesangClip, isTrue);
+
+    await repo.setSprechgesangClip(phrase.phraseId, null);
+    after = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(after.sprechgesangClipPath, isNull);
+  });
+
+  test('setGuideClip stores the caregiver-designated stress index (item A)',
+      () async {
+    final phrase = (await repo.getActivePhrases()).first;
+    expect(phrase.stressIndex, isNull); // none until a contour is confirmed
+    await repo.setGuideClip(
+      phrase.phraseId,
+      'guides/clip.enc',
+      2,
+      nucleiMs: const [120, 480],
+      stressIndex: 0,
+    );
+    final updated = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(updated.stressIndex, 0);
+    expect(updated.guideNucleiMs, [120, 480]);
+    // Re-saving without a stress index leaves the existing choice intact.
+    await repo.setGuideClip(phrase.phraseId, 'guides/clip2.enc', 2,
+        nucleiMs: const [120, 480]);
+    final again = (await repo.getAllPhrases())
+        .firstWhere((p) => p.phraseId == phrase.phraseId);
+    expect(again.stressIndex, 0);
   });
 
   test('setRung persists the progression rung; phrases default to unison', () async {
@@ -142,7 +314,7 @@ void main() {
     expect(s.bpm, 50);
   });
 
-  test('resetProgression sends every phrase back to R0 and clears tier/tempo',
+  test('resetProgression sends every phrase back to unison and clears tier/tempo',
       () async {
     const profileId = AppDatabase.defaultProfileId;
     final phrases = await repo.getAllPhrases();
@@ -156,9 +328,9 @@ void main() {
 
     await repo.resetProgression(profileId);
 
-    // Every phrase row is back at R0…
+    // Every phrase row is back at the unison entry (R2 — tap/hum are the warm-up)…
     for (final p in await repo.getAllPhrases()) {
-      expect(p.rung, Rung.r0, reason: 'phrase ${p.phraseId} reset to R0');
+      expect(p.rung, Rung.r2, reason: 'phrase ${p.phraseId} reset to unison');
     }
     // …and the progression record is gone, so reads fall back to defaults.
     final s = await repo.getProgressionState(profileId, phraseId);

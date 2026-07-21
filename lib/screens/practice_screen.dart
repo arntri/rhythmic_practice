@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../app/orientation.dart';
 import '../data/models.dart';
 import '../data/practice_repository.dart';
 import '../metronome/metronome_engine.dart';
@@ -53,6 +54,17 @@ class _PracticeScreenState extends State<PracticeScreen>
   // Confirmed syllable-nucleus timings per phrase — used to align the recorded
   // guide's pacing to the beat (Fix 3).
   Map<int, List<int>> _guideNuclei = {};
+  // R7 (answer-the-question) probe question per phrase: the text to speak and an
+  // optional recorded clip. Both may be null → R7 plays a generic prompt.
+  Map<int, String?> _probeText = {};
+  Map<int, String?> _probeClip = {};
+  // Melody cue data (item 9): confirmed syllable count + caregiver-designated
+  // high-note syllable per phrase, for the on-screen high–low contour.
+  Map<int, int> _syllableCount = {};
+  Map<int, int?> _stressIndex = {};
+  // Whether each phrase has a slow-spoken Sprechgesang clip (item 15) — gates the
+  // auto-progression tier gate from raising a word into Level 3 without one.
+  Map<int, bool> _hasSprechClip = {};
   // The caregiver's base session tempo (BPM); per-word tempo never exceeds it.
   int _baseBpm = MitProgression.defaultBpm;
   // Decrypted name-card photos by phrase id (therapy addendum §6), for display.
@@ -63,6 +75,13 @@ class _PracticeScreenState extends State<PracticeScreen>
   // progression_state table; `_blockLabels` accumulates the current 3-rep block.
   final Map<int, ProgressionState> _progState = {};
   final Map<int, List<int>> _blockLabels = {};
+  // Park-and-switch + end-on-success (audit item 14). [_switchedFor] and
+  // [_switchCount] stop a park from re-queuing endlessly; [_closerAdded] ensures
+  // at most one gentle end-on-success closer per session.
+  final Set<int> _switchedFor = {};
+  int _switchCount = 0;
+  bool _closerAdded = false;
+  static const _maxSwitches = 3;
   String? _sessionId;
   String? _profileId;
   String? _error;
@@ -95,21 +114,6 @@ class _PracticeScreenState extends State<PracticeScreen>
 
   /// Delayed repeat (r5): longer pause after the model before the mic opens.
   static const _delayedRepeatMs = 2200;
-
-  /// Hum (r1): how long the user hums to the beat before the verdict — long
-  /// enough to actually settle into several beats (not flash by).
-  static const _humMs = 8000;
-
-  // --- R0 (tap-along exposure window) — tunable -----------------------------
-  /// Length of ONE r0 tap window. The user gets a window to tap in time; if the
-  /// tap-sync threshold isn't met within it, they get a SECOND window of equal
-  /// length, then r0 promotes regardless. r0 NEVER blocks (the no-trap floor).
-  static const _r0TapWindowMs = 6000;
-
-  /// Tap-sync score (0–1) within an r0 window that counts as "in time" — meeting
-  /// it on the FIRST window skips the second. It only decides whether a second
-  /// window is offered; it can never permanently hold the user on r0.
-  static const _r0TapSyncThreshold = 0.5;
 
   /// Solo (r6): brief "get ready" the word shows before the mic opens.
   static const _soloPromptMs = 2500;
@@ -197,18 +201,57 @@ class _PracticeScreenState extends State<PracticeScreen>
     }
   }
 
+  /// Fallback probe spoken at R7 when the caregiver hasn't set a question for a
+  /// phrase — keeps the step running (never blocks) while still cueing a solo
+  /// answer. A configured [PracticePhrase.probeQuestionText] always wins.
+  static const _genericProbe = 'Your turn — say the word.';
+
+  // Play the R7 probe question for [id]: the recorded clip if present, else TTS of
+  // the caregiver's probe text, else a gentle generic prompt. Unlike the guide it
+  // is NOT beat-warped (it's a question, not the target word to pace to the beat).
+  void _playProbe(int id, {required void Function() onComplete}) {
+    _guideStartTimer?.cancel();
+    _guide.play(
+      clipPath: _probeClip[id],
+      text: (_probeText[id]?.trim().isNotEmpty ?? false)
+          ? _probeText[id]!
+          : _genericProbe,
+      stretch: 1.0, // natural pace — a question isn't elongated like the word
+      ttsStretch: 1.2, // just slightly slow for clarity
+      onComplete: onComplete,
+    );
+  }
+
   int _prepCountdown = 0; // >0 while the unison "get ready" countdown is showing
   Timer? _prepTimer;
-  Timer? _r0Timer; // drives r0's tap windows
   Timer? _guideStartTimer; // delays guide playback to the next beat (beat-sync)
-  // How r0 promoted, per phrase, for the block log: window1-pass / window2-forced.
-  final Map<int, String> _r0Outcome = {};
 
-  /// Reps a word runs this session: r0 is a single tap-window visit (it always
-  /// promotes after at most two internal windows); every judged rung (r1–r6)
-  /// runs a 3-rep caregiver-verdict block.
-  int _repsForRung(Rung rung) =>
-      rung == Rung.r0 ? 1 : MitProgression.repsPerBlock;
+  /// Reps a word runs this session. Every word rung (r2–r6) runs a 3-rep
+  /// caregiver-verdict block; tapping/humming are the session warm-up, not words.
+  int _repsForRung(Rung rung) => MitProgression.repsPerBlock;
+
+  // Park-and-switch / end-on-success helpers (item 14).
+  // The easiest currently-succeeding session word (lowest rung, not parked) —
+  // the word to switch to after a park, or the gentle closer. [exclude] skips the
+  // word that just parked/failed.
+  int? _easiestActiveWord({int? exclude}) {
+    int? best;
+    var bestLevel = 1 << 30;
+    for (final e in _progState.entries) {
+      if (e.key == exclude || e.value.parked) continue;
+      final level = e.value.rung.level;
+      if (level < bestLevel) {
+        bestLevel = level;
+        best = e.key;
+      }
+    }
+    return best;
+  }
+
+  // One practice block (reps of a phrase at its current rung) for splicing into
+  // the session.
+  List<int> _blockFor(int id) =>
+      [for (var i = 0; i < _repsForRung(_rungOf(id)); i++) id];
 
   @override
   void initState() {
@@ -240,6 +283,22 @@ class _PracticeScreenState extends State<PracticeScreen>
       _guideClip = {for (final p in phrases) p.phraseId: p.guideClipPath};
       // Confirmed syllable timings per phrase (for voice-to-beat alignment).
       _guideNuclei = {for (final p in phrases) p.phraseId: p.guideNucleiMs};
+      // R7 probe question per phrase (text + optional recorded clip). Null/absent
+      // → R7 plays a gentle generic prompt (never blocks — item 11).
+      _probeText = {for (final p in phrases) p.phraseId: p.probeQuestionText};
+      _probeClip = {for (final p in phrases) p.phraseId: p.probeQuestionClipPath};
+      // Melody cue (item 9): syllable count comes from the confirmed guide nuclei
+      // (falls back to the stored count); the high-note syllable is the caregiver
+      // designation. Both may be absent → the practice screen shows no cue.
+      _syllableCount = {
+        for (final p in phrases)
+          p.phraseId:
+              p.guideNucleiMs.isNotEmpty ? p.guideNucleiMs.length : p.syllableCount
+      };
+      _stressIndex = {for (final p in phrases) p.phraseId: p.stressIndex};
+      _hasSprechClip = {
+        for (final p in phrases) p.phraseId: p.hasSprechgesangClip
+      };
       _baseBpm = profile.metronomeBpm;
       // The progression record per phrase — the single source of truth for the
       // rung this session. Rung seeds from the phrase row (caregiver-visible in
@@ -293,11 +352,12 @@ class _PracticeScreenState extends State<PracticeScreen>
         ],
         // Generous safety cap: the screen normally drives the advance per rung
         // (below); this only fires if that never arrives. In demo mode we lift it
-        // so nothing auto-advances — the R0 arena (which has no screen-driven
-        // advance there) holds until the presenter picks another stage.
+        // so nothing auto-advances — the presenter holds a word until they pick
+        // another stage from the demo bar.
         guideBeats: _demoModeEnabled ? (1 << 30) : 12,
         rungOf: _rungOf,
         onEnterReferencePrompt: _onEnterReference,
+        onEnterWarmUpHum: _onEnterWarmUpHum,
         onEnterInputCapture: _onEnterCapture,
         // Capture ended (silence or beat timeout): stop the mic.
         onLeaveInputCapture: (_) => _mic.stop(),
@@ -352,20 +412,26 @@ class _PracticeScreenState extends State<PracticeScreen>
   /// Falls back to unison (R2) — the lowest appropriate rung — never a high one.
   Rung _rungOf(int id) => _progState[id]?.rung ?? Rung.r2;
 
+  // Session warm-up, hum phase (State_1b): the beat is the whole point, so keep
+  // the tick full and emphasise it while the user hums along. The controller
+  // auto-advances into the first word after its warm-up beats.
+  void _onEnterWarmUpHum() {
+    _engine?.tickVolume = 1.0;
+    _engine?.soundEnabled = _soundPreference;
+    _engine?.emphasizeBeat = true;
+  }
+
   void _onEnterReference(int id) {
     // New prompt: invalidate any advance still pending from the previous one.
     _promptGen++;
-    final rung = _rungOf(id);
-    // Beat/hum rungs (r0/r1) ARE about the beat — keep the tick at full volume
-    // and emphasise the haptic so the user can feel/follow it. Unison rungs
-    // (r2/r3) keep a SOFT tick under the spoken word so the user hears one beat
-    // per syllable (safe — no mic there). Repeat rungs (r4–r6) mute the tick: the
-    // model is solo and the mic opens for capture, so a tick would bleed in.
-    final beatPhase = rung == Rung.r0 || rung == Rung.r1;
+    final rung = _rungOf(id); // a WORD rung: r2–r6 (r7 deferred/off)
+    // Unison rungs (r2/r3) keep a SOFT tick under the spoken word so the user
+    // hears one beat per syllable (safe — no mic there). Repeat/solo rungs (r4–r6)
+    // mute the tick: the model is solo and the mic opens, so a tick would bleed in.
     final unison = rung.isUnison; // r2/r3
-    _engine?.tickVolume = beatPhase ? 1.0 : _kUnisonTickVolume;
-    _engine?.soundEnabled = (beatPhase || unison) ? _soundPreference : false;
-    _engine?.emphasizeBeat = beatPhase;
+    _engine?.tickVolume = _kUnisonTickVolume;
+    _engine?.soundEnabled = unison ? _soundPreference : false;
+    _engine?.emphasizeBeat = false; // beat emphasis is the warm-up's job now
     // Fix 2: apply this word's tempo to the live metronome HERE — at the prompt
     // boundary, never mid-prompt. The controller now counts beats-since-entry, so
     // re-anchoring the scheduler can't trip a timeout. The guard means it only
@@ -381,44 +447,14 @@ class _PracticeScreenState extends State<PracticeScreen>
     } else if (rung.playsModel) {
       // r4/r5: listen to the model (beat-warped), then a breath, then the mic.
       _playGuide(id, rung, onComplete: () => _advanceAfter(_afterModelMs(rung)));
-    } else if (rung == Rung.r0) {
-      // r0: a tap-along exposure window (two windows max, then promote). In demo
-      // mode we DON'T run the windows — they finalize an attempt, evaluate a
-      // block and move on; the presenter just wants to SHOW the R0 arena and
-      // switch stages by hand with the demo bar.
-      if (!_demoModeEnabled) _startR0Windows(id);
+    } else if (rung == Rung.r7) {
+      // r7 (answer-the-question) — DEFERRED/off, not reached in the active ladder;
+      // kept as scaffold: play the probe question, then a breath, then the mic.
+      _playProbe(id, onComplete: () => _advanceAfter(_repeatBreathMs));
     } else {
-      // No model plays here: r1 hum window (then verdict), r6 brief get-ready
-      // (then the mic). Both end via the controller's rung routing.
-      _advanceAfter(rung == Rung.r1 ? _humMs : _soloPromptMs);
+      // r6 solo: a brief "get ready", then the mic (via the controller's routing).
+      _advanceAfter(_soloPromptMs);
     }
-  }
-
-  // r0: a tap-along exposure window. Give one window; if the tap-sync threshold
-  // is met within it, promote now; otherwise give a SECOND equal window and then
-  // promote regardless. Tap performance ONLY decides whether the second window is
-  // offered — r0 always ends in promotion (the no-trap floor). No verdict.
-  void _startR0Windows(int id) {
-    _r0Timer?.cancel();
-    debugPrint('[PROGRESSION] R0 phrase=$id "${_phraseText[id]}" window1 start '
-        '(${_r0TapWindowMs}ms, threshold $_r0TapSyncThreshold)');
-    _r0Timer = Timer(const Duration(milliseconds: _r0TapWindowMs), () {
-      final score = _controller?.currentSyncScore;
-      if (score != null && score >= _r0TapSyncThreshold) {
-        _r0Outcome[id] = 'window1-pass(${score.toStringAsFixed(2)})';
-        debugPrint('[PROGRESSION] R0 phrase=$id window1 PASSED '
-            'score=${score.toStringAsFixed(2)} → promote');
-        if (mounted) _controller?.endReferencePrompt();
-      } else {
-        debugPrint('[PROGRESSION] R0 phrase=$id window1 missed '
-            'score=${score?.toStringAsFixed(2) ?? "none"} → offering window2');
-        _r0Timer = Timer(const Duration(milliseconds: _r0TapWindowMs), () {
-          _r0Outcome[id] = 'window2-forced';
-          debugPrint('[PROGRESSION] R0 phrase=$id force-promote after window2');
-          if (mounted) _controller?.endReferencePrompt();
-        });
-      }
-    });
   }
 
   // Unison prep countdown, then play the model and advance to the verdict.
@@ -515,6 +551,25 @@ class _PracticeScreenState extends State<PracticeScreen>
     if (_demoModeEnabled) return;
     final sessionId = _sessionId;
     if (sessionId == null) return;
+
+    // End-on-success (item 14): NEVER end the session on a failed verdict. This
+    // runs in the SYNCHRONOUS prefix (before the first await) so the closer is
+    // appended before the controller's finish-attempt decides whether to
+    // complete. If this Fail is on the last word, splice a gentle, guaranteed-
+    // gentle closer (a low-rung word — co-production auto-advances, no verdict) so
+    // the last thing she does is a light win. At most one closer per session.
+    final controller = _controller;
+    if (result.evaluationLabel == 0 &&
+        !_closerAdded &&
+        controller != null &&
+        controller.isOnLastWord) {
+      final closer = _easiestActiveWord(exclude: result.phraseId);
+      if (closer != null) {
+        _closerAdded = true;
+        controller.appendPhrases(_blockFor(closer));
+      }
+    }
+
     final rung = _rungOf(result.phraseId);
     try {
       final attemptId = await _repository.insertAttempt(
@@ -528,6 +583,21 @@ class _PracticeScreenState extends State<PracticeScreen>
         rungAtAttempt: rung.level, // Phase 3: which rung this was produced at
         tierAtAttempt:
             _progState[result.phraseId]?.syllableTier, // and which syllable tier
+        // v20 (item 16c): the metronome tempo this attempt was produced at — the
+        // beat reference onset-vs-beat steadiness is measured against later.
+        tempoBpm: _progState[result.phraseId]?.bpm ?? _baseBpm,
+      );
+      // ML logging (item 16a): persist this attempt's RAW tap stream (touch-down
+      // time + dwell + beat phase per tap), tied to the attempt/phrase/rung. The
+      // aggregate sync score on the attempt row can't reconstruct dwell or
+      // inter-tap-interval variance — the fatigue detector's inputs — so the
+      // un-aggregated stream has to be saved here at session time.
+      await _repository.insertTapEvents(
+        attemptId: attemptId,
+        phraseId: result.phraseId,
+        sessionId: sessionId,
+        rung: rung.level,
+        taps: result.taps,
       );
       // Phase 2B: score the clip against the phrase's recorded guide (similarity
       // + anchor) — only for rungs that yield a clean solo production (r4–r6).
@@ -578,19 +648,26 @@ class _PracticeScreenState extends State<PracticeScreen>
     // protects a phrase already above the cap.
     final result = _mit.evaluateBlock(before, labels, rungCap: _sessionRungCap);
     var after = result.state;
-    // Slow loop (MIT tier gate): top-rung (R6 solo) mastery only, and only WITHIN
-    // the current tier — the word's pass rate at R6 at this tier across the recent
-    // sessions. Only fires while the word is actually at R6 (so a back-up after a
+    // Slow loop (MIT tier gate): top-rung mastery only (now R7, answer-the-
+    // question — the hardest solo step), and only WITHIN the current tier — the
+    // word's pass rate at the top rung at this tier across the recent sessions.
+    // Only fires while the word is actually at the top rung (so a back-up after a
     // strong run can't trip it). Read it first so we can log why a tier did/didn't
     // advance. Raising the tier resets the rung to unison.
     final history = await _repository.sessionPassRates(profileId,
         phraseId: phraseId,
-        minRung: Rung.r6.level,
+        minRung: topRung.level,
         tier: before.syllableTier);
-    final willRaiseTier =
-        before.rung == Rung.r6 && _mit.shouldRaiseTier(history);
+    // Sprechgesang gate (item 15): a word can only be raised INTO Level 3 once it
+    // has a slow-spoken clip — L3 is unavailable without it.
+    final sprechOk = sprechgesangSatisfied(
+        level: before.syllableTier + 1,
+        hasSprechgesangClip: _hasSprechClip[phraseId] ?? false);
+    final willRaiseTier = before.rung == topRung &&
+        sprechOk &&
+        _mit.shouldRaiseTier(history, currentTier: before.syllableTier);
     debugPrint('[PROGRESSION] tier-gate phrase=$phraseId "${_phraseText[phraseId]}" '
-        'tier=${before.syllableTier} atTopRung=${before.rung == Rung.r6} '
+        'tier=${before.syllableTier} atTopRung=${before.rung == topRung} '
         'topRungPassRates=${history.map((r) => r.toStringAsFixed(2)).toList()} '
         'sessions=${history.length} '
         'need ${_mit.tierWindow}@≥${_mit.tierPassRate} → raiseTier=$willRaiseTier');
@@ -603,20 +680,16 @@ class _PracticeScreenState extends State<PracticeScreen>
 
     // Device-visible: the exact transition and the verdict tally that drove it,
     // so any wrong move (e.g. a Pass block lowering the rung) is plain in logcat.
-    // For r0, also note which window promoted (or whether it was force-promoted).
     final passes = labels.where((l) => l == 1).length;
     final fails = labels.where((l) => l == 0).length;
     final unsure = labels.where((l) => l == 2).length;
-    final r0note =
-        before.rung == Rung.r0 ? ' r0=${_r0Outcome[phraseId] ?? "?"}' : '';
     final capNote =
         _sessionRungCap == null ? '' : ' cap=${_sessionRungCap!.code}';
     debugPrint('[PROGRESSION] block phrase=$phraseId "${_phraseText[phraseId]}" '
-        'labels=$labels (P=$passes F=$fails U=$unsure)$r0note$capNote '
+        'labels=$labels (P=$passes F=$fails U=$unsure)$capNote '
         'rung ${before.rung.code}→${after.rung.code} '
         'tier ${before.syllableTier}→${after.syllableTier} '
         'bpm ${before.bpm}→${after.bpm} outcome=${result.outcome.name}');
-    _r0Outcome.remove(phraseId);
 
     // Update the single in-memory source of truth, then persist: the rung to the
     // phrase row (caregiver-visible) and the tier/tempo to the progression record.
@@ -632,6 +705,22 @@ class _PracticeScreenState extends State<PracticeScreen>
       _showProgressChange(phraseId, before, after);
     } else if (result.outcome == RungOutcome.slowedTempo) {
       _showTempoEased(phraseId, after.bpm);
+    }
+
+    // Park-and-switch (item 14): when a word parks after repeated failure, don't
+    // press on with the fixed list — splice in a word she can currently succeed
+    // at so the next thing is a win. Guarded so a run of parks can't grow the
+    // session without bound, and we never switch to an already-parked word.
+    if (result.outcome == RungOutcome.parked &&
+        _switchCount < _maxSwitches &&
+        _switchedFor.add(phraseId)) {
+      final easier = _easiestActiveWord(exclude: phraseId);
+      if (easier != null) {
+        _switchCount++;
+        _controller?.insertAfterCurrent(_blockFor(easier));
+        debugPrint('[PROGRESSION] park-and-switch: "${_phraseText[phraseId]}" '
+            'parked → next up "${_phraseText[easier]}"');
+      }
     }
   }
 
@@ -718,11 +807,9 @@ class _PracticeScreenState extends State<PracticeScreen>
     if (_rungOf(id) == rung) return; // already there — nothing to do
     // Cancel everything in flight from the prompt we're interrupting.
     _prepTimer?.cancel();
-    _r0Timer?.cancel();
     _guideStartTimer?.cancel();
     _guide.stop();
     _mic.stop();
-    _r0Outcome.remove(id);
     // In-session source of truth only (no setRung / upsertProgressionState).
     final before = _progState[id] ??
         ProgressionState(
@@ -761,7 +848,9 @@ class _PracticeScreenState extends State<PracticeScreen>
                       fontWeight: FontWeight.w800,
                       letterSpacing: 1.5)),
             ),
-            for (final r in Rung.values)
+            // Only the active WORD ladder (r2–r6) — r0/r1 are the warm-up and r7
+            // is deferred, so a presenter jumps between real word rungs.
+            for (final r in activeLadder)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 2),
                 child: _demoRungButton(r, selected: r == current),
@@ -802,7 +891,6 @@ class _PracticeScreenState extends State<PracticeScreen>
   @override
   void dispose() {
     _prepTimer?.cancel();
-    _r0Timer?.cancel();
     _guideStartTimer?.cancel();
     _engine?.dispose();
     _controller?.dispose();
@@ -836,10 +924,12 @@ class _PracticeScreenState extends State<PracticeScreen>
             photoByPhrase: _photo,
             targetDisplay: _targetDisplay,
             repsPerBlock: MitProgression.repsPerBlock,
+            syllableCountByPhrase: _syllableCount,
+            stressIndexByPhrase: _stressIndex,
             // Caregiver escape hatch from the element-free R0/R1 tap sandbox
             // (the right-edge verdict dock is hidden there).
             onCaregiverUnlock: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
+              PortraitPageRoute<void>(
                 builder: (_) => SettingsPortal(repository: _repository),
               ),
             ),

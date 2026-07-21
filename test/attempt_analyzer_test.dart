@@ -51,18 +51,28 @@ void main() {
       final r = analyzer.analyzeSamples(samples, anchorMfcc: ownMfcc);
       expect(r.gatePassed, isTrue);
       expect(r.contentSimilarityScore, 1.0);
+      expect(r.mfccDistance, 0.0); // item 16b: identical → zero raw distance
+    });
+
+    test('no template → both similarity and distance are null', () {
+      final samples = Float64List.fromList(toneDoubles(440, 1000));
+      final r = analyzer.analyzeSamples(samples);
+      expect(r.contentSimilarityScore, isNull);
+      expect(r.mfccDistance, isNull);
     });
 
     test('different-sounding clips score below an identical match', () {
       final low = Float64List.fromList(toneDoubles(300, 1000));
       final high = Float64List.fromList(toneDoubles(3000, 1000));
       final lowMfcc = mfcc.extract(low);
-      final crossScore =
-          analyzer.analyzeSamples(high, anchorMfcc: lowMfcc).contentSimilarityScore!;
-      final selfScore =
-          analyzer.analyzeSamples(low, anchorMfcc: lowMfcc).contentSimilarityScore!;
-      expect(crossScore, lessThan(selfScore));
-      expect(selfScore, 1.0);
+      final cross = analyzer.analyzeSamples(high, anchorMfcc: lowMfcc);
+      final self = analyzer.analyzeSamples(low, anchorMfcc: lowMfcc);
+      expect(cross.contentSimilarityScore!, lessThan(self.contentSimilarityScore!));
+      expect(self.contentSimilarityScore, 1.0);
+      // Item 16b: the raw distance moves the opposite way — a bigger difference is
+      // a larger distance, un-squashed by the 1/(1+cost) similarity mapping.
+      expect(cross.mfccDistance!, greaterThan(self.mfccDistance!));
+      expect(self.mfccDistance, 0.0);
     });
 
     test('analyzeFile decodes from disk and matches analyzeSamples', () async {

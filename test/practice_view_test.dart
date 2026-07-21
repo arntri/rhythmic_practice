@@ -19,12 +19,16 @@ class _Host extends StatefulWidget {
       required this.text,
       this.photos = const {},
       this.targetDisplay = TargetDisplay.both,
-      this.repsPerBlock = 1});
+      this.repsPerBlock = 1,
+      this.syllableCount = const {},
+      this.stressIndex = const {}});
   final PracticeController controller;
   final Map<int, String> text;
   final Map<int, Uint8List> photos;
   final TargetDisplay targetDisplay;
   final int repsPerBlock;
+  final Map<int, int> syllableCount;
+  final Map<int, int?> stressIndex;
 
   @override
   State<_Host> createState() => _HostState();
@@ -55,6 +59,8 @@ class _HostState extends State<_Host> with SingleTickerProviderStateMixin {
             photoByPhrase: widget.photos,
             targetDisplay: widget.targetDisplay,
             repsPerBlock: widget.repsPerBlock,
+            syllableCountByPhrase: widget.syllableCount,
+            stressIndexByPhrase: widget.stressIndex,
           ),
         ),
       );
@@ -66,6 +72,7 @@ void main() {
     final controller = PracticeController(
       phraseIds: const [10],
       tapsToAdvance: 1,
+      warmUpBeats: 0,
       guideBeats: 1,
       captureBeats: 1,
     );
@@ -74,10 +81,11 @@ void main() {
     controller.start();
     await tester.pump();
 
-    // State_1: prompts the user to tap the beat.
-    expect(find.textContaining('Tap the beat'), findsOneWidget);
+    // State_1: the warm-up tap arena (feel the beat).
+    expect(find.text('Feel the beat'), findsOneWidget);
 
-    // An in-time tap (phase 0.0 from the idle engine) advances to State_2.
+    // An in-time tap locks the beat; a zero-length warm-up flows straight into
+    // the first word (State_2).
     controller.onBeat(0);
     await tester.tap(find.byType(PracticeView));
     await tester.pump();
@@ -109,6 +117,7 @@ void main() {
     final controller = PracticeController(
       phraseIds: const [10],
       tapsToAdvance: 1,
+      warmUpBeats: 0,
       guideBeats: 1,
       captureBeats: 1,
       rungOf: (_) => rung,
@@ -122,30 +131,45 @@ void main() {
     await checks();
   }
 
-  testWidgets('r0 element-free: pulse ring + stage chip + its own activity cue',
+  testWidgets('warm-up TAP arena (preparation): ring + "Feel the beat", no word',
       (tester) async {
-    await pumpAtRung(tester, Rung.r0, () async {
-      // Element-free layout: the WORD is withheld, but the stage shows its own
-      // no-word activity cue (R0 invites listening/tapping) so it's unmistakable
-      // from R1. The pulse ring is the target and the stage chip names the rung.
-      expect(find.text('Help'), findsNothing); // word withheld at r0
-      expect(find.text('Feel the beat'), findsOneWidget); // r0's own cue
-      expect(find.text('Hum along'), findsNothing); // not r1's cue
-      expect(find.byKey(const Key('ef_pulse_ring')), findsOneWidget); // target
-      expect(find.textContaining(Rung.r0.title), findsWidgets); // stage chip
-    });
+    // The element-free arena is now the session WARM-UP, keyed on STATE (not a
+    // per-word rung). Preparation = the tap phase: the word is withheld and the
+    // pulse ring is the only target.
+    final controller = PracticeController(
+      phraseIds: const [10],
+      tapsToAdvance: 1,
+      warmUpBeats: 4, // a real warm-up so we can observe its phases
+      rungOf: (_) => Rung.r2,
+    );
+    await tester.pumpWidget(_Host(controller: controller, text: const {10: 'Help'}));
+    controller.start();
+    await tester.pump();
+    expect(find.text('Help'), findsNothing); // word withheld during warm-up
+    expect(find.text('Feel the beat'), findsOneWidget); // the tap cue
+    expect(find.text('Hum along'), findsNothing);
+    expect(find.byKey(const Key('ef_pulse_ring')), findsOneWidget); // target
   });
 
-  testWidgets('r1 element-free: pulse ring + stage chip + its own activity cue',
+  testWidgets('warm-up HUM arena (warmUpHum): ring + "Hum along", no word',
       (tester) async {
-    await pumpAtRung(tester, Rung.r1, () async {
-      // R1 shows a DIFFERENT cue (invites voicing), distinguishing it from R0.
-      expect(find.text('Help'), findsNothing);
-      expect(find.text('Hum along'), findsOneWidget); // r1's own cue
-      expect(find.text('Feel the beat'), findsNothing); // not r0's cue
-      expect(find.byKey(const Key('ef_pulse_ring')), findsOneWidget);
-      expect(find.textContaining(Rung.r1.title), findsWidgets);
-    });
+    final controller = PracticeController(
+      phraseIds: const [10],
+      tapsToAdvance: 1,
+      warmUpBeats: 4,
+      rungOf: (_) => Rung.r2,
+    );
+    await tester.pumpWidget(_Host(controller: controller, text: const {10: 'Help'}));
+    controller.start();
+    await tester.pump();
+    controller.onBeat(0);
+    await tester.tap(find.byType(PracticeView)); // lock the beat → hum phase
+    await tester.pump();
+    expect(controller.state, PracticeState.warmUpHum);
+    expect(find.text('Help'), findsNothing); // still no word
+    expect(find.text('Hum along'), findsOneWidget); // the hum cue
+    expect(find.text('Feel the beat'), findsNothing);
+    expect(find.byKey(const Key('ef_pulse_ring')), findsOneWidget);
   });
 
   testWidgets('r2+ shows the word', (tester) async {
@@ -153,6 +177,54 @@ void main() {
       expect(find.text('Help'), findsOneWidget);
       expect(find.text('Feel the beat'), findsNothing);
     });
+  });
+
+  testWidgets('melody cue shows for a multi-syllable phrase with a stress index',
+      (tester) async {
+    final controller = PracticeController(
+      phraseIds: const [10],
+      tapsToAdvance: 1,
+      warmUpBeats: 0,
+      guideBeats: 1,
+      captureBeats: 1,
+      rungOf: (_) => Rung.r4,
+    );
+    await tester.pumpWidget(_Host(
+      controller: controller,
+      text: const {10: 'Water'},
+      syllableCount: const {10: 2},
+      stressIndex: const {10: 0},
+    ));
+    controller.start();
+    await tester.pump();
+    controller.onBeat(0);
+    await tester.tap(find.byType(PracticeView));
+    await tester.pump(); // referencePrompt
+    expect(find.byKey(const Key('melody_cue')), findsOneWidget);
+  });
+
+  testWidgets('no melody cue for a single-syllable / undesignated phrase',
+      (tester) async {
+    final controller = PracticeController(
+      phraseIds: const [10],
+      tapsToAdvance: 1,
+      warmUpBeats: 0,
+      guideBeats: 1,
+      captureBeats: 1,
+      rungOf: (_) => Rung.r4,
+    );
+    await tester.pumpWidget(_Host(
+      controller: controller,
+      text: const {10: 'Help'},
+      syllableCount: const {10: 1}, // single syllable — nothing to rise above
+      stressIndex: const {10: 0},
+    ));
+    controller.start();
+    await tester.pump();
+    controller.onBeat(0);
+    await tester.tap(find.byType(PracticeView));
+    await tester.pump();
+    expect(find.byKey(const Key('melody_cue')), findsNothing);
   });
 
   testWidgets('the on-screen stage label is the current rung\'s own title',
@@ -172,6 +244,7 @@ void main() {
     final controller = PracticeController(
       phraseIds: const [10, 10, 10], // one word, a 3-rep block
       tapsToAdvance: 1,
+      warmUpBeats: 0,
       guideBeats: 1,
       captureBeats: 1,
       rungOf: (_) => Rung.r4,
@@ -195,6 +268,7 @@ void main() {
     final controller = PracticeController(
       phraseIds: const [10],
       tapsToAdvance: 1,
+      warmUpBeats: 0,
       guideBeats: 1,
       captureBeats: 1,
       rungOf: (_) => Rung.r4,
@@ -224,6 +298,7 @@ void main() {
     final controller = PracticeController(
       phraseIds: const [10],
       tapsToAdvance: 1,
+      warmUpBeats: 0,
       guideBeats: 1,
       captureBeats: 1,
       rungOf: (_) => Rung.r4,

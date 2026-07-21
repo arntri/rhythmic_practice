@@ -3,6 +3,26 @@ import 'package:flutter/foundation.dart';
 import 'progression.dart';
 import 'tap_sync.dart';
 
+/// One raw tap in the per-tap stream (ML logging audit item 16a): the monotonic
+/// touch-down time ([downMs], ms since the session's controller started), the
+/// metronome [phase] at touch-down (0..1), and the press [dwellMs]
+/// (touch-down→up) — null until (or unless) the release is observed.
+///
+/// This is the un-aggregated data the fatigue detector needs: the attempt's lone
+/// [AttemptResult.syncScore] averages the phases away, so dwell and inter-tap-
+/// interval variance can't be recovered from it. Persisted per tap to
+/// `tap_events`.
+class TapEvent {
+  TapEvent({required this.downMs, required this.phase, this.dwellMs});
+
+  final int downMs;
+  final double phase;
+
+  /// Press duration (ms). Mutable so the release handler can fill it in on the
+  /// matching pointer-up; stays null if the finger-up is never seen.
+  int? dwellMs;
+}
+
 /// The finalized result of one phrase attempt, handed to [PracticeController.
 /// onAttemptComplete] so the screen can persist it. Mirrors the columns of
 /// `exercise_attempts` that we can fill in at State_4.
@@ -14,6 +34,10 @@ class AttemptResult {
   final int? durationMs;
   final String? localEncryptedAudioPath;
 
+  /// The raw per-tap stream captured during this attempt (item 16a). Empty when
+  /// no taps were made. The screen persists these to `tap_events`.
+  final List<TapEvent> taps;
+
   const AttemptResult({
     required this.phraseId,
     required this.syncScore,
@@ -21,14 +45,22 @@ class AttemptResult {
     required this.latencyMs,
     required this.durationMs,
     this.localEncryptedAudioPath,
+    this.taps = const [],
   });
 }
 
 /// The four states of the practice loop (brief §3), plus a terminal state for
 /// when the session's phrase limit is reached.
 enum PracticeState {
-  /// State_1: metronome runs; user taps in time to lock into the beat.
+  /// State_1a: session warm-up, part 1 — metronome runs; user taps in time to
+  /// lock into the beat. Readiness only; NOT tied to any word (tapping can never
+  /// advance a word). Runs once at session start.
   preparation,
+
+  /// State_1b: session warm-up, part 2 — hum along to the beat for a few beats,
+  /// then flow into the first word. Also once-per-session; general vocal warm-up,
+  /// not a per-word rung.
+  warmUpHum,
 
   /// State_2: the audio guide intones the phrase on the beat; phrase shown.
   referencePrompt,
@@ -66,19 +98,47 @@ class PracticeController extends ChangeNotifier {
     this.lockTolerance = 0.25,
     this.guideBeats = 4,
     this.captureBeats = 6,
+    this.warmUpBeats = 8,
     Rung Function(int phraseId)? rungOf,
     this.onEnterReferencePrompt,
+    this.onEnterWarmUpHum,
     this.onEnterInputCapture,
     this.onLeaveInputCapture,
     this.onEnterSystemTransition,
     this.onAttemptComplete,
   })  : assert(phraseIds.isNotEmpty),
-        _phraseIds = phraseIds,
+        // Copy into a GROWABLE list so the session can be extended mid-run —
+        // park-and-switch ([insertAfterCurrent]) and the end-on-success closer
+        // ([appendPhrases]) both mutate it (a caller's const list would throw).
+        _phraseIds = List<int>.of(phraseIds),
         // Default to R4 (listen-then-repeat) so callers that don't pass rungs
         // get the classic play-model-then-capture flow.
         _rungOf = rungOf ?? ((_) => Rung.r4);
 
   final List<int> _phraseIds;
+
+  /// Park-and-switch (audit item 14): splice [ids] in to be practised **next**,
+  /// right after the current rep — so when a word parks after repeated failure
+  /// the session immediately moves to something she can succeed at, instead of
+  /// pressing on with the fixed list. No-op once the session is complete.
+  void insertAfterCurrent(List<int> ids) {
+    if (_state == PracticeState.sessionComplete || ids.isEmpty) return;
+    _phraseIds.insertAll(_index + 1, ids);
+    notifyListeners();
+  }
+
+  /// End-on-success (audit item 14): append [ids] as a gentle closer so the
+  /// session never ends on a failed verdict. No-op once complete.
+  void appendPhrases(List<int> ids) {
+    if (_state == PracticeState.sessionComplete || ids.isEmpty) return;
+    _phraseIds.addAll(ids);
+    notifyListeners();
+  }
+
+  /// Whether the current word is the LAST word-group of the session (nothing
+  /// different follows) — the screen uses this to decide an end-on-success closer
+  /// before the final attempt completes.
+  bool get isOnLastWord => currentWordIndex == wordCount - 1;
 
   /// The progression rung for a phrase (therapy addendum §4). Drives whether
   /// capture happens (R0 has none) — the screen handles the audio specifics.
@@ -104,8 +164,15 @@ class PracticeController extends ChangeNotifier {
   /// Real silence-based close arrives in Step 5.
   final int captureBeats;
 
+  /// Beats the warm-up hum runs before flowing into the first word (State_1b →
+  /// State_2). Once per session.
+  final int warmUpBeats;
+
   // Seams for later steps. Each receives the current phrase id.
   final void Function(int phraseId)? onEnterReferencePrompt;
+
+  /// Fired when the warm-up hum phase begins (no phrase id — it's session-level).
+  final void Function()? onEnterWarmUpHum;
   final void Function(int phraseId)? onEnterInputCapture;
   final void Function(int phraseId)? onLeaveInputCapture;
 
@@ -126,9 +193,8 @@ class PracticeController extends ChangeNotifier {
   int get currentPhraseId => _phraseIds[_index];
 
   /// Word position/count by CONSECUTIVE-group, so the "Word x of y" counter is
-  /// right even when words have different rep counts (R0 runs a single window;
-  /// R1–R6 run a 3-rep block). Each word's reps sit together in [_phraseIds], so
-  /// a change in id marks a new word.
+  /// right regardless of rep count. Each word runs a 3-rep block and its reps sit
+  /// together in [_phraseIds], so a change in id marks a new word.
   int get currentWordIndex {
     var w = 0;
     for (var i = 1; i <= _index && i < _phraseIds.length; i++) {
@@ -158,6 +224,17 @@ class PracticeController extends ChangeNotifier {
 
   final List<double> _tapPhases = [];
 
+  // The raw per-tap stream for the current attempt (item 16a), parallel to
+  // [_tapPhases]: same taps, but each carries its touch-down time + dwell so the
+  // fatigue detector can read dwell trend and inter-tap-interval variance. Reset
+  // per phrase (like [_tapPhases]) and flushed into the [AttemptResult].
+  final List<TapEvent> _taps = [];
+
+  // Monotonic clock for tap timestamps — started at [start], so every tap's
+  // [TapEvent.downMs] is ms since the session began. A Stopwatch (not wall-clock)
+  // keeps timings immune to clock changes and is trivially testable.
+  final Stopwatch _clock = Stopwatch();
+
   int? _evaluationLabel;
   int? get evaluationLabel => _evaluationLabel;
 
@@ -182,6 +259,9 @@ class PracticeController extends ChangeNotifier {
   void start() {
     _index = 0;
     _resetPhrase();
+    _clock
+      ..reset()
+      ..start(); // tap timestamps are ms from here
     _state = PracticeState.preparation;
     _beatsInState = 0;
     notifyListeners();
@@ -194,6 +274,11 @@ class PracticeController extends ChangeNotifier {
     _beatsInState++;
 
     switch (_state) {
+      case PracticeState.warmUpHum:
+        // Warm-up hum runs for a few beats, then flows into the first word.
+        if (_beatsInState >= warmUpBeats) {
+          _enter(PracticeState.referencePrompt);
+        }
       case PracticeState.referencePrompt:
         if (_beatsInState >= guideBeats) {
           _leaveReferencePrompt();
@@ -221,8 +306,10 @@ class PracticeController extends ChangeNotifier {
     _leaveReferencePrompt();
   }
 
-  // Leave Reference_Prompt for the right next state given the rung: r4–r6 open
-  // the mic; r1–r3 go to the caregiver verdict (no mic); r0 auto-completes.
+  // Leave Reference_Prompt for the right next state given the WORD rung: r4–r6
+  // open the mic; r2–r3 go to the caregiver verdict (no mic). Warm-up rungs
+  // (r0/r1) never reach here — they're not words — but the neutral auto-complete
+  // stays as a safety net.
   void _leaveReferencePrompt() {
     // r4–r6 produce a clean solo → open the mic (recorded + scored); the
     // caregiver verdict follows capture.
@@ -230,23 +317,18 @@ class PracticeController extends ChangeNotifier {
       _enter(PracticeState.inputCapture);
       return;
     }
-    // r1–r3 are judged but NOT recorded (the model/hum makes the mic useless):
-    // r1 participation, r2 unison, r3 carried-the-fade → straight to the verdict.
+    // r2 unison / r3 carried-the-fade are judged but NOT recorded (the model
+    // playing makes the mic useless) → straight to the caregiver verdict.
     if (currentRung.isJudged) {
       _enter(PracticeState.systemTransition);
       return;
     }
-    // r0 is the only un-judged rung: a tap-along exposure window that advances on
-    // EXPOSURE, not performance. It auto-completes with a neutral label so poor
-    // (or absent) taps can never produce a Fail that blocks progress — the screen
-    // runs r0's two tap windows and always promotes (a user with hand weakness
-    // must never be trapped below speech). The r0 tap-sync score is still captured
-    // on the AttemptResult for analytics; it never gates advancement.
+    // Safety net only: a non-word (warm-up) rung would auto-complete neutral so it
+    // can never produce a Fail. Words never take this path.
     _finishAttempt(_neutral);
   }
 
-  /// Neutral label recorded for the un-judged r0 exposure rung: it counts toward
-  /// neither Pass nor Fail in progression or stats.
+  /// Neutral label for a non-judged rung: counts toward neither Pass nor Fail.
   static const _neutral = 2; // Unsure
 
   /// Step 5: called by the microphone when it auto-closes on ~4.5 s of silence,
@@ -258,22 +340,44 @@ class PracticeController extends ChangeNotifier {
     _enter(PracticeState.systemTransition);
   }
 
-  /// Called when the user taps the screen. [phase] is the metronome phase at the
-  /// moment of the tap (0.0 = on the beat). Taps are collected for the sync
-  /// score; in Preparation, enough in-time taps advance to State_2.
+  /// Called on touch-DOWN when the user taps the screen. [phase] is the metronome
+  /// phase at the moment of the tap (0.0 = on the beat). Taps are collected for
+  /// the sync score AND as a raw [TapEvent] (item 16a); in Preparation, enough
+  /// in-time taps advance to State_2. The matching [registerTapRelease] fills in
+  /// the dwell on finger-up.
   void registerTap(double phase) {
     if (_state == PracticeState.sessionComplete) return;
     _tapPhases.add(phase);
+    _taps.add(TapEvent(downMs: _clock.elapsedMilliseconds, phase: phase));
 
     if (_state == PracticeState.preparation &&
         isInTime(phase, tolerance: lockTolerance)) {
       _inTimeTaps++;
       if (_inTimeTaps >= tapsToAdvance) {
-        _enter(PracticeState.referencePrompt);
+        // Beat locked → the warm-up's hum phase, then the first word. Tapping
+        // only ends the warm-up; it can never advance a word's rung. A zero-length
+        // warm-up ([warmUpBeats] <= 0) flows straight into the first word.
+        _enter(PracticeState.warmUpHum);
+        if (warmUpBeats <= 0) _enter(PracticeState.referencePrompt);
         return;
       }
     }
     notifyListeners();
+  }
+
+  /// Called on touch-UP for the most recent tap, to record its dwell (press
+  /// duration). Sets the dwell on the latest [TapEvent] that doesn't have one yet;
+  /// a no-op if the release arrives with no matching down (e.g. after a phrase
+  /// reset). Dwell stays null when the release is never observed — the fatigue
+  /// detector treats a null dwell as "not measured", not zero.
+  void registerTapRelease() {
+    for (var i = _taps.length - 1; i >= 0; i--) {
+      if (_taps[i].dwellMs == null) {
+        _taps[i].dwellMs =
+            (_clock.elapsedMilliseconds - _taps[i].downMs).clamp(0, 1 << 30);
+        return;
+      }
+    }
   }
 
   /// Demo only: re-run the CURRENT word from the top of its reference prompt,
@@ -308,6 +412,7 @@ class PracticeController extends ChangeNotifier {
       latencyMs: _latencyMs,
       durationMs: _durationMs,
       localEncryptedAudioPath: _audioPath,
+      taps: List<TapEvent>.of(_taps), // the raw stream for this attempt (item 16a)
     ));
 
     if (_index + 1 < _phraseIds.length) {
@@ -328,6 +433,8 @@ class PracticeController extends ChangeNotifier {
     _state = next;
     _beatsInState = 0;
     switch (next) {
+      case PracticeState.warmUpHum:
+        onEnterWarmUpHum?.call();
       case PracticeState.referencePrompt:
         onEnterReferencePrompt?.call(currentPhraseId);
       case PracticeState.inputCapture:
@@ -343,6 +450,7 @@ class PracticeController extends ChangeNotifier {
   void _resetPhrase() {
     _inTimeTaps = 0;
     _tapPhases.clear();
+    _taps.clear();
     _evaluationLabel = null;
     _latencyMs = null;
     _durationMs = null;

@@ -10,32 +10,33 @@
 // `adb logcat`. Run:  flutter test test/progression_log_sim_test.dart
 //
 // What it shows: a word starts LOW (R0), R0 always promotes after its two
-// windows, repeated Passes climb R1→R6 and NEVER drop, and the syllable tier
-// only jumps after sustained ~90% mastery AT the top rung (R6), resetting to R2.
+// windows, repeated Passes climb R1→R7 and NEVER drop, and the syllable tier
+// only jumps after sustained ~90% mastery AT the top rung (R7, answer-the-
+// question), resetting to R2.
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rhythmic_practice/practice/mit_progression.dart';
 import 'package:rhythmic_practice/practice/progression.dart';
 
 void main() {
-  test('SIM: one word climbs R0→R6, then the tier gate fires (prints the log)', () {
-    const engine = MitProgression(); // 40–70 BPM, tier 5 sessions @ 0.9
+  test('SIM: one word climbs R0→R7, then the tier gate fires (prints the log)', () {
+    const engine = MitProgression(); // 40–70 BPM, tier 10 sessions @ 0.9
     const id = 7;
     const text = 'Help';
     const r0WindowMs = 6000;
     const r0Threshold = 0.5;
 
-    // Top-rung (R6) per-session pass-rate history, oldest→newest. The repo query
-    // builds this from attempts with rung_at_attempt >= 6; here we append 1.0 for
-    // each session the word is practised AT R6 (all-Pass), exactly as the live
-    // query would. Sessions below R6 contribute nothing (the gate's whole point).
+    // Top-rung (R7) per-session pass-rate history, oldest→newest. The repo query
+    // builds this from attempts with rung_at_attempt >= 7; here we append 1.0 for
+    // each session the word is practised AT R7 (all-Pass), exactly as the live
+    // query would. Sessions below R7 contribute nothing (the gate's whole point).
     final topRungRates = <double>[];
 
     var state = const ProgressionState(profileId: 'p', phraseId: id, rung: Rung.r0);
 
     // A scripted run: R0 (window mechanism), then all-Pass blocks until the tier
-    // gate trips. Enough R6 sessions (≥5) to demonstrate the gate firing.
-    const sessions = 12;
+    // gate trips. Enough R7 sessions (≥10) to demonstrate the gate firing.
+    const sessions = 18; // enough R7 sessions (≥10) for the wider window
 
     print('=== SIM: word "$text" climbing the ladder ===');
     for (var s = 1; s <= sessions; s++) {
@@ -63,17 +64,17 @@ void main() {
       final result = engine.evaluateBlock(before, labels);
       var after = result.state;
 
-      // This session's R6 attempts are already saved before the block evaluates,
-      // so a session AT R6 contributes to its OWN tier-gate check (as live). The
+      // This session's R7 attempts are already saved before the block evaluates,
+      // so a session AT R7 contributes to its OWN tier-gate check (as live). The
       // history is scoped to the CURRENT tier (live: tier_at_attempt filter).
-      if (before.rung == Rung.r6) topRungRates.add(1.0);
+      if (before.rung == topRung) topRungRates.add(1.0);
 
       // --- Slow loop (tier gate): top-rung-only, current-tier pass-rate -------
-      // Only fires while the word is at R6 (a back-up can't trip it).
+      // Only fires while the word is at the top rung (a back-up can't trip it).
       final willRaise =
-          before.rung == Rung.r6 && engine.shouldRaiseTier(topRungRates);
+          before.rung == topRung && engine.shouldRaiseTier(topRungRates);
       print('[PROGRESSION] tier-gate phrase=$id "$text" '
-          'tier=${before.syllableTier} atTopRung=${before.rung == Rung.r6} '
+          'tier=${before.syllableTier} atTopRung=${before.rung == topRung} '
           'topRungPassRates=${topRungRates.map((r) => r.toStringAsFixed(2)).toList()} '
           'sessions=${topRungRates.length} '
           'need ${engine.tierWindow}@≥${engine.tierPassRate} → raiseTier=$willRaise');

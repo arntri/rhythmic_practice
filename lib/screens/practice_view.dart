@@ -28,6 +28,7 @@ Color stageColor(Rung rung) => switch (rung) {
       Rung.r4 => const Color(0xFFF6EFD9), // warm cream — repeat after
       Rung.r5 => const Color(0xFFF7E9DD), // soft peach — delayed repeat
       Rung.r6 => const Color(0xFFEDE7F6), // gentle lavender — say it on your own
+      Rung.r7 => const Color(0xFFEAE4F2), // deeper lavender — answer the question
     };
 
 /// A distinct symbol per stage, paired with [stageColor] so colour is never the
@@ -40,6 +41,7 @@ IconData stageIcon(Rung rung) => switch (rung) {
       Rung.r4 => Icons.repeat, // repeat after
       Rung.r5 => Icons.timer, // delayed repeat
       Rung.r6 => Icons.fiber_manual_record, // single dot — your turn
+      Rung.r7 => Icons.help_outline, // a question to answer
     };
 
 /// The visual layer of a practice session. It is intentionally "dumb": given a
@@ -56,6 +58,8 @@ class PracticeView extends StatelessWidget {
     this.targetDisplay = TargetDisplay.both,
     this.repsPerBlock = 1,
     this.onCaregiverUnlock,
+    this.syllableCountByPhrase = const {},
+    this.stressIndexByPhrase = const {},
   });
 
   final MetronomeEngine engine;
@@ -63,9 +67,9 @@ class PracticeView extends StatelessWidget {
   final Map<int, String> phraseText;
 
   /// Opens the caregiver area from the in-session slide-to-unlock cog shown in
-  /// the element-free R0/R1 layout (the right-edge verdict dock is hidden there,
-  /// so this is the caregiver's only escape hatch out of the tap sandbox). Null
-  /// in widget tests / when no caregiver entry is wired — the cog isn't drawn.
+  /// the element-free warm-up arena (the right-edge verdict dock is hidden there,
+  /// so this is the caregiver's only escape hatch out of the tap/hum sandbox).
+  /// Null in widget tests / when no caregiver entry is wired — the cog isn't drawn.
   final VoidCallback? onCaregiverUnlock;
 
   /// How many consecutive reps make up one word's practice block (therapy §4).
@@ -79,10 +83,24 @@ class PracticeView extends StatelessWidget {
   /// How the target's visual is shown (audio is always the primary cue).
   final TargetDisplay targetDisplay;
 
+  /// Per-phrase confirmed syllable count (from the recorded guide's nuclei) and
+  /// the caregiver-designated high-note syllable — together they drive the
+  /// on-screen **melody cue** (intonation flow, item 9): the high–low contour
+  /// shown while the word is presented, so intonation is reinforced visually and
+  /// not only through the rhythm. Empty/absent → no cue (e.g. single-syllable or
+  /// a phrase whose guide was recorded before contours existed).
+  final Map<int, int> syllableCountByPhrase;
+  final Map<int, int?> stressIndexByPhrase;
+
   void _onTap() {
     // Score the tap by how close it landed to the beat (current phase).
     controller.registerTap(engine.phase.value);
   }
+
+  // Finger-up (or a cancelled tap): record the press dwell for the tap just made
+  // (item 16a). A cancelled tap still gets a dwell from its touch-down time so the
+  // stream isn't biased toward only the clean taps.
+  void _onTapRelease() => controller.registerTapRelease();
 
   @override
   Widget build(BuildContext context) {
@@ -91,6 +109,9 @@ class PracticeView extends StatelessWidget {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (_) => _onTap(),
+      // Touch-up / cancel close the tap so its dwell (press duration) is recorded.
+      onTapUp: (_) => _onTapRelease(),
+      onTapCancel: _onTapRelease,
       child: AnimatedBuilder(
         animation: controller,
         builder: (context, _) => _buildForState(context),
@@ -103,33 +124,36 @@ class PracticeView extends StatelessWidget {
     final phrase = phraseText[controller.currentPhraseId] ?? '';
     final capturing = state == PracticeState.inputCapture;
 
-    // A word runs several consecutive reps (r0 = 1 window; r1–r6 = 3-rep block),
-    // so the top-left counter shows the WORD position (by consecutive group), not
-    // the rep. The corner chip shows the current STAGE (which rung we're on).
+    // Each word runs a 3-rep block, so the top-left counter shows the WORD
+    // position (by consecutive group), not the rep. The corner chip shows the
+    // current STAGE (which rung we're on).
     final wordIndex = controller.currentWordIndex;
     final wordCount = controller.wordCount;
 
-    // R0 (receive the beat) and R1's hum window are pure exposure — no word, no
-    // photo — so they get a streamlined, element-free layout: the whole landscape
-    // canvas is a tap sandbox with the pulse ring as the only target (support must
-    // never read as "a word/test thrown at me"). This covers preparation /
-    // referencePrompt; r1 then leaves it for the caregiver verdict (systemTransition
-    // → the normal layout with the dock), while r0 auto-promotes and is never judged.
-    final rung = controller.currentRung;
-    final elementFree = (rung == Rung.r0 || rung == Rung.r1) &&
-        (state == PracticeState.preparation ||
-            state == PracticeState.referencePrompt);
-    if (elementFree) {
-      return _buildElementFree(context, state, rung, wordIndex + 1, wordCount);
+    // Session WARM-UP (once, at the start): tap the beat (preparation) then hum
+    // (warmUpHum). It's pure readiness — no word, no photo — so it gets the
+    // streamlined, element-free arena: the whole canvas is a tap/hum sandbox with
+    // the pulse ring as the only target. A synthetic warm-up "rung" picks the tap
+    // (r0) vs hum (r1) visuals. Words never use this layout.
+    if (state == PracticeState.preparation ||
+        state == PracticeState.warmUpHum) {
+      final warmRung =
+          state == PracticeState.preparation ? Rung.r0 : Rung.r1;
+      return _ElementFreeArena(
+        engine: engine,
+        state: state,
+        rung: warmRung,
+        pillText: 'Warm-up',
+        onCaregiverUnlock: onCaregiverUnlock,
+      );
     }
+    final rung = controller.currentRung;
     final inPractice = state == PracticeState.referencePrompt ||
         state == PracticeState.inputCapture ||
         state == PracticeState.systemTransition;
-    final pillText = switch (state) {
-      PracticeState.preparation => 'Find the beat',
-      PracticeState.sessionComplete => 'Done',
-      _ => 'Word ${wordIndex + 1} of $wordCount',
-    };
+    final pillText = state == PracticeState.sessionComplete
+        ? 'Done'
+        : 'Word ${wordIndex + 1} of $wordCount';
 
     return AnimatedContainer(
       // A clear green glow signals the mic is live (State_3); otherwise the
@@ -177,29 +201,8 @@ class PracticeView extends StatelessWidget {
     );
   }
 
-  // --- Element-free R0/R1 layout (brief §1–3) -------------------------------
-  // A deep forest-green tap sandbox + an oversized neon-mint concentric pulse
-  // ring as the sole target. No word, no photo, no caregiver dock. It's a
-  // stateful widget because the beat pulse (+15% on the beat, 70 ms decay) and
-  // the R0 lock flash are ephemeral animations this dumb StatelessView can't hold.
-  Widget _buildElementFree(
-    BuildContext context,
-    PracticeState state,
-    Rung rung,
-    int wordPos,
-    int wordCount,
-  ) {
-    return _ElementFreeArena(
-      engine: engine,
-      state: state,
-      rung: rung,
-      pillText: 'Word $wordPos of $wordCount',
-      onCaregiverUnlock: onCaregiverUnlock,
-    );
-  }
-
   // The "when to speak" cue shown above the word for the speaking rungs. Null
-  // means no cue line (it never reaches here for r0/r1, which show their own cue).
+  // means no cue line. r0/r1 are the warm-up (their own arena), never here.
   String? _speakCue(PracticeState state, Rung rung) {
     if (state == PracticeState.inputCapture) return 'Now you say it';
     // referencePrompt:
@@ -207,39 +210,70 @@ class PracticeView extends StatelessWidget {
     if (rung == Rung.r2) return 'Say it together'; // full unison
     if (rung == Rung.r4 || rung == Rung.r5) return 'Listen…'; // model plays
     if (rung == Rung.r6) return 'Get ready…'; // solo, mic about to open
+    if (rung == Rung.r7) return 'Answer the question'; // probe plays, then mic
     return null;
+  }
+
+  // The high–low melody cue (item 9): a small row of dots, one per syllable, the
+  // caregiver-designated high-note syllable raised. Returns null when there's no
+  // real contour to show — no stress designated, or a single syllable (nothing to
+  // rise above). A quiet reinforcement of the intonation, never the primary cue.
+  Widget? _melodyCue(BuildContext context) {
+    final id = controller.currentPhraseId;
+    final count = syllableCountByPhrase[id] ?? 0;
+    final stress = stressIndexByPhrase[id];
+    if (count < 2 || stress == null || stress < 0 || stress >= count) {
+      return null;
+    }
+    const raise = 12.0;
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      key: const Key('melody_cue'),
+      height: 44,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          for (var i = 0; i < count; i++)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 5),
+              child: Transform.translate(
+                offset: Offset(0, i == stress ? -raise : raise),
+                child: Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: i == stress ? scheme.primary : scheme.outlineVariant,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Widget _centerContent(BuildContext context, PracticeState state, String phrase) {
     switch (state) {
+      // Warm-up states render in the element-free arena, never here — but the
+      // switch must stay exhaustive.
       case PracticeState.preparation:
-        return Text(
-          'Tap the beat\n(${controller.inTimeTaps}/${controller.tapsToAdvance})',
-          textAlign: TextAlign.center,
-          style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w600),
-        );
+      case PracticeState.warmUpHum:
+        return const SizedBox.shrink();
       case PracticeState.referencePrompt:
       case PracticeState.inputCapture:
-        // The lowest rungs aren't about the word yet — show the activity, not the
-        // text, so the user isn't pushed to read/speak before they're meant to
-        // (therapy addendum §4: r0 receive the beat, r1 hum). r2+ show the word.
-        switch (controller.currentRung) {
-          case Rung.r0:
-            return _rungCue(context,
-                icon: Icons.music_note,
-                title: 'Feel the beat',
-                subtitle: 'Tap along if you like — no need to speak.');
-          case Rung.r1:
-            return _rungCue(context,
-                icon: Icons.graphic_eq,
-                title: 'Hum along',
-                subtitle: 'Hum to the beat — sound, not words yet.');
-          default:
-            // r2+: a clear step cue ("Listen" / "Say it together" / "Now you
-            // say it") above the visual target. Audio is always the primary cue;
-            // the VISUAL follows [targetDisplay] — picture-led by default, the
-            // written word optional — and we never pile all of them on.
-            final cue = _speakCue(state, controller.currentRung);
+        {
+          // r2–r6: a clear step cue ("Listen" / "Say it together" / "Now you
+          // say it") above the visual target. Audio is always the primary cue;
+          // the VISUAL follows [targetDisplay] — picture-led by default, the
+          // written word optional — and we never pile all of them on.
+          final cue = _speakCue(state, controller.currentRung);
+            // Melody cue (item 9): only while presenting the word (referencePrompt
+            // — not while the user is mid-capture) and only when there's a real
+            // multi-syllable contour to show.
+            final melodyCue = state == PracticeState.referencePrompt
+                ? _melodyCue(context)
+                : null;
             final photo = photoByPhrase[controller.currentPhraseId];
             final showPhoto = photo != null && targetDisplay != TargetDisplay.word;
             // Word shows for word/both, or as a fallback when picture-only has no
@@ -302,6 +336,10 @@ class PracticeView extends StatelessWidget {
                             fontSize: 96, fontWeight: FontWeight.bold),
                       ),
                     ),
+                  if (melodyCue != null) ...[
+                    const SizedBox(height: 14),
+                    melodyCue,
+                  ],
                 ],
               ),
             );
@@ -317,20 +355,17 @@ class PracticeView extends StatelessWidget {
             );
         }
       case PracticeState.systemTransition:
-        // The verdict prompt reflects what was just done. The word is shown only
-        // for the speaking rungs (r2+); for feel-the-beat / hum there was no
-        // word, so showing one here would read as "a word thrown at me".
-        // The verdict question makes the bar explicit, getting stricter as support
-        // drops: r1 participation → r2 unison → r3 fade → r4–r6 solo. (r0 is never
-        // judged — it auto-promotes — so it never reaches this state.)
+        // The verdict prompt reflects what was just done — every word rung is
+        // judged. The bar gets stricter as support drops: r2 unison → r3 fade →
+        // r4–r6 solo. (Warm-up r0/r1 aren't words and never reach this state.)
         final rung = controller.currentRung;
         final question = switch (rung) {
-          Rung.r1 => 'Did they try to hum or voice along?',
           Rung.r2 => 'Did they say the word with the app?',
           Rung.r3 => 'Did they carry it as the model faded?',
           Rung.r4 => 'Did they say it back on their own?',
           Rung.r5 => 'Did they say it on their own after the pause?',
           Rung.r6 => 'Did they say it independently?',
+          Rung.r7 => 'Did they answer with the word?',
           _ => 'How was that?',
         };
         return Padding(
@@ -381,36 +416,6 @@ class PracticeView extends StatelessWidget {
   // The caregiver's verdict control: a vertical bar on the right edge, split
   // into three full-height choices. The stored evaluation_label is
   // 0 = Fail, 1 = Pass, 2 = Unsure.
-  // A large, friendly cue for the no-word rungs (r0 beat, r1 hum) — an icon, a
-  // short instruction, and a calmer subtitle.
-  Widget _rungCue(BuildContext context,
-      {required IconData icon,
-      required String title,
-      required String subtitle}) {
-    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 76, color: muted),
-          const SizedBox(height: 16),
-          Text(
-            title,
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 56, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            subtitle,
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 22, color: muted),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _caregiverDock(BuildContext context) {
     return SafeArea(
       left: false,
@@ -506,14 +511,15 @@ class _InfoPill extends StatelessWidget {
   }
 }
 
-/// The element-free R0/R1 arena (brief §1–3): a deep forest-green full-screen tap
-/// sandbox with an oversized neon-mint concentric pulse ring as the sole target.
-/// Stateful so it can own two ephemeral animations the dumb [PracticeView] can't:
+/// The element-free warm-up arena: a full-screen tap/hum sandbox with an
+/// oversized concentric pulse ring as the sole target, used for the once-per-
+/// session warm-up (preparation = tap, warmUpHum = hum). Stateful so it can own
+/// two ephemeral animations the dumb [PracticeView] can't:
 ///  • Visual pacing pulse — the rings snap out 15% exactly on the beat, then
 ///    contract back to base within a 70 ms window (mirroring the haptic).
-///  • R0 lock flash — a 200 ms full-opacity burst when the user locks the beat
-///    (the 3-in-time-tap move from preparation → reference prompt).
-/// R1 voicing glow shifts the canvas to emerald during R1's hum window.
+///  • Lock flash — a 200 ms full-opacity burst when the user locks the beat
+///    (the 3-in-time-tap move from preparation → warm-up hum).
+/// A voicing glow shifts the canvas to emerald during the hum phase.
 class _ElementFreeArena extends StatefulWidget {
   const _ElementFreeArena({
     required this.engine,
@@ -581,11 +587,10 @@ class _ElementFreeArenaState extends State<_ElementFreeArena>
   @override
   void didUpdateWidget(_ElementFreeArena old) {
     super.didUpdateWidget(old);
-    // R0 lock flash: 3 in-time taps just moved preparation → reference prompt,
-    // i.e. the user locked onto the beat. Burst to signal entrainment is locked.
-    if (widget.rung == Rung.r0 &&
-        old.state == PracticeState.preparation &&
-        widget.state == PracticeState.referencePrompt) {
+    // Lock flash: 3 in-time taps just moved preparation → the warm-up hum, i.e.
+    // the user locked onto the beat. Burst to signal entrainment is locked.
+    if (old.state == PracticeState.preparation &&
+        widget.state == PracticeState.warmUpHum) {
       _flash.forward(from: 0);
     }
   }
@@ -600,10 +605,10 @@ class _ElementFreeArenaState extends State<_ElementFreeArena>
 
   @override
   Widget build(BuildContext context) {
-    // R1 voicing glow: R1 never opens the mic (co-production), so its reference
-    // prompt IS the sound-production window — warm the canvas to invite voice.
+    // Hum voicing glow: the warm-up hum phase IS the sound-production window —
+    // warm the canvas to invite voice.
     final voicing =
-        widget.rung == Rung.r1 && widget.state == PracticeState.referencePrompt;
+        widget.rung == Rung.r1 && widget.state == PracticeState.warmUpHum;
     return AnimatedContainer(
       duration: const Duration(milliseconds: 450),
       curve: Curves.easeInOut,
@@ -730,8 +735,8 @@ class _ElementFreeArenaState extends State<_ElementFreeArena>
 }
 
 /// A small corner indicator of which STAGE of the MIT ladder we're on — the rung
-/// code + its title (e.g. "R2 · Say it together"), with seven dots showing the
-/// ladder R0→R6 and the current rung filled in accent.
+/// code + its title (e.g. "R2 · Say it together"), with a dot per active word
+/// rung (R2→R6) and the current rung filled in accent.
 class _StageIndicator extends StatelessWidget {
   const _StageIndicator({required this.rung});
 
@@ -755,7 +760,7 @@ class _StageIndicator extends StatelessWidget {
               style: const TextStyle(
                   fontWeight: FontWeight.w600, color: AppColors.onCalm)),
           const SizedBox(width: 10),
-          for (final r in Rung.values)
+          for (final r in activeLadder)
             Padding(
               padding: const EdgeInsets.only(left: 3),
               child: Icon(

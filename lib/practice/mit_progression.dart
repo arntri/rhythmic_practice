@@ -85,7 +85,9 @@ class ProgressionState {
 
 /// What the fast loop did with one attempt (for transparency / logging / tests).
 enum RungOutcome {
-  /// Co-production rung (R0–R3): auto-proceeded one rung toward the judged rungs.
+  /// A non-judged rung auto-proceeded one rung. In the active ladder every WORD
+  /// rung (r2–r6) is judged, so this only applies to the warm-up rungs (r0/r1),
+  /// which words never sit on — it remains for completeness/safety.
   autoProceeded,
 
   /// Caregiver Pass at a judged rung → moved up one rung.
@@ -120,15 +122,16 @@ class ProgressionResult {
 /// **Fast loop** ([evaluateBlock], per 3-rep block) — rung movement. A word is
 /// practiced exactly [repsPerBlock] consecutive reps at its current rung (always
 /// all 3, no early exit, no mid-block change); the **block** is the progression
-/// unit, evaluated only after the 3 reps:
-///   - Pure co-production rungs (R0 receive-beat, R1 hum, R2 unison) aren't
-///     Pass/Failed: the block just **auto-proceeds** one rung.
-///   - At judged rungs — R3 (unison-fade, the first independent production) and
-///     R4–R6 (repeat / delayed / solo): **≥2 Passes → up one rung**; **mostly
-///     Fails (≥2) → lower the tempo first, then (at the floor) back up one rung**
-///     (errorless restore-support); a **failed block at the backed-up rung →
-///     park** the word for the session; **Unsure counts toward neither**. A
-///     failed R3 therefore never forces R4 — it holds or backs up.
+/// unit, evaluated only after the 3 reps. **Every word rung is judged** (R0/R1 tap
+/// and hum are the session warm-up, not per-word rungs):
+///   - R2 unison (the floor) → R3 fade → R4–R6 (repeat / delayed / solo):
+///     **≥2 Passes → up one rung** (clamped at the active top R6, never into the
+///     deferred R7); **mostly Fails (≥2) → lower the tempo first, then (at the
+///     floor) back up one rung** (errorless restore-support, clamped at the unison
+///     floor R2); a **failed block at the backed-up rung → park** the word for the
+///     session; **Unsure counts toward neither**. A failed R3 never forces R4 — it
+///     holds or backs up; a failed R2 slows then parks (it can't fall below
+///     unison).
 ///
 /// **Slow loop** ([shouldRaiseTier]/[raiseTier], across sessions) — tier movement:
 ///   - Raise the syllable tier ONLY when the pass rate is ≥ [tierPassRate] across
@@ -140,7 +143,7 @@ class MitProgression {
     this.maxBpm = 70,
     this.tempoStep = 10,
     this.tierPassRate = 0.9,
-    this.tierWindow = 5,
+    this.tierWindow = 10,
   });
 
   // Tempo bounds (therapy addendum §5: 40–70 BPM). [defaultBpm] is the tempo a
@@ -161,10 +164,10 @@ class MitProgression {
   static const _fail = 0;
   static const _pass = 1;
 
-  /// Whether a rung is Pass/Failed by the caregiver. R0 is the only un-judged
-  /// rung — a tap-along exposure window that always promotes — so it auto-
-  /// proceeds; judging (and so the 3-rep block) runs at R1–R6.
-  bool isJudged(Rung rung) => rung.isJudged; // r1–r6
+  /// Whether a rung is Pass/Failed by the caregiver. Warm-up rungs (R0 tap / R1
+  /// hum) aren't per-word and aren't judged; every WORD rung (R2 unison → R6 solo)
+  /// is judged, so the 3-rep block runs across the whole active ladder.
+  bool isJudged(Rung rung) => rung.isJudged; // r2–r6 (word rungs)
 
   /// Fast loop: fold one completed 3-rep **block** into the state. [labels] are
   /// the caregiver verdicts (0 Fail / 1 Pass / 2 Unsure) for the reps — normally
@@ -209,7 +212,8 @@ class MitProgression {
             s.copyWith(bpm: slower), RungOutcome.slowedTempo);
       }
       return ProgressionResult(
-        s.copyWith(rung: s.rung.lowered(), bpm: defaultBpm, backedUp: true),
+        // Back up within the active ladder (clamped at the unison floor R2).
+        s.copyWith(rung: s.rung.loweredActive(), bpm: defaultBpm, backedUp: true),
         RungOutcome.backedUp,
       );
     }
@@ -239,30 +243,36 @@ class MitProgression {
   /// Slow loop (the MIT-grounded criterion): whether the word has earned a harder
   /// syllable tier — sustained mastery, not one good block. True only when its
   /// pass rate is ≥ [tierPassRate] (default 0.9) across the last [tierWindow]
-  /// (default 5) sessions. [sessionPassRates] is the per-session pass-rate
-  /// history at the word's TOP rung (R6 solo), oldest → newest — the caller
-  /// supplies a top-rung-only history so tier load only rises after solo mastery.
-  bool shouldRaiseTier(List<double> sessionPassRates) {
+  /// (default 10) sessions AND the word isn't already at the top level
+  /// ([maxLevel] = 3 — audit item 12, there are only three levels).
+  /// [sessionPassRates] is the per-session pass-rate history at the word's TOP
+  /// rung (R6 solo), oldest → newest — the caller supplies a top-rung-only
+  /// history so tier load only rises after solo mastery. [currentTier] lets the
+  /// gate stop at the cap.
+  bool shouldRaiseTier(List<double> sessionPassRates, {int currentTier = 1}) {
+    if (currentTier >= maxLevel) return false; // already at the top level
     if (sessionPassRates.length < tierWindow) return false;
     final window = sessionPassRates.sublist(sessionPassRates.length - tierWindow);
     final avg = window.reduce((a, b) => a + b) / window.length;
     return avg >= tierPassRate;
   }
 
-  /// Apply a tier raise: +1 tier and RESET the rung to full support (unison) and
-  /// the tempo to default — one dial at a time (never raise load and drop support
-  /// together).
+  /// Apply a tier raise: +1 tier (clamped to [maxLevel]) and RESET the rung to
+  /// full support (unison) and the tempo to default — one dial at a time (never
+  /// raise load and drop support together).
   ProgressionState raiseTier(ProgressionState s) => s.copyWith(
-        syllableTier: s.syllableTier + 1,
+        syllableTier: math.min(s.syllableTier + 1, maxLevel),
         rung: supportForNewTier(), // R2
         bpm: defaultBpm,
         backedUp: false,
         parked: false,
       );
 
-  // Advance one rung, clamped to [rungCap] when the caregiver capped the session.
+  // Advance one rung within the active ladder (clamped at the active top R6,
+  // never into the deferred R7), then clamped to [rungCap] when the caregiver
+  // capped the session.
   Rung _advance(Rung rung, Rung? cap) {
-    final next = rung.raised();
+    final next = rung.raisedActive();
     if (cap != null && next.index > cap.index) return cap;
     return next;
   }

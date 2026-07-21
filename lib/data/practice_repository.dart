@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 import '../analysis/attempt_analyzer.dart';
 import '../analysis/mfcc_codec.dart';
 import '../practice/mit_progression.dart';
+import '../practice/practice_controller.dart' show TapEvent;
 import '../practice/progression.dart';
 import 'app_database.dart';
 import 'models.dart';
@@ -71,6 +72,7 @@ class PracticeRepository {
     double? playbackSpeed,
     Object? sessionRungCap = _unset,
     bool? demoModeEnabled,
+    bool? soloModeEnabled,
   }) async {
     final db = await _db;
     final values = <String, Object?>{
@@ -90,6 +92,8 @@ class PracticeRepository {
         'session_rung_cap': sessionRungCap as int?,
       if (demoModeEnabled != null)
         'demo_mode_enabled': demoModeEnabled ? 1 : 0,
+      if (soloModeEnabled != null)
+        'solo_mode_enabled': soloModeEnabled ? 1 : 0,
       if (guardianConsentGranted != null)
         'guardian_consent_granted': guardianConsentGranted ? 1 : 0,
       // Record when/what was consented to, only when granting.
@@ -111,21 +115,35 @@ class PracticeRepository {
 
   /// Records a caregiver-recorded guide clip for a phrase: the encrypted file
   /// path (which doubles as the DTW reference), the caregiver-confirmed
-  /// [syllableCount], and the confirmed syllable-nucleus timings [nucleiMs]
-  /// (therapy addendum §2 — detection pre-fills, the caregiver confirms).
+  /// [syllableCount], the confirmed syllable-nucleus timings [nucleiMs] (therapy
+  /// addendum §2 — detection pre-fills, the caregiver confirms), and the
+  /// caregiver-designated high-note [stressIndex] (intonation flow, item A).
+  /// [stressIndex] is written only when provided, so re-saving a clip without it
+  /// leaves an existing contour choice intact.
   Future<void> setGuideClip(
     int phraseId,
     String guideClipPath,
     int syllableCount, {
     List<int> nucleiMs = const [],
+    int? stressIndex,
   }) async {
     final db = await _db;
+    // Set the phrase's ENTRY rung from its level (audit item 13) — but ONLY when
+    // the word has never been practised (no progression_state row), so
+    // re-recording a guide for a word already climbing the ladder never resets
+    // its rung. The level is derived from the just-confirmed syllable count.
+    final progressed = (await db.query('progression_state',
+            where: 'phrase_id = ?', whereArgs: [phraseId], limit: 1))
+        .isNotEmpty;
+    final entryRung = entryRungForLevel(levelForSyllableCount(syllableCount));
     await db.update(
       'practice_phrases',
       {
         'guide_clip_path': guideClipPath,
         'syllable_count': syllableCount,
         'guide_nuclei_ms': nucleiMs.join(','),
+        'stress_index': ?stressIndex, // written only when provided (null skips)
+        if (!progressed) 'current_rung': entryRung.level,
       },
       where: 'phrase_id = ?',
       whereArgs: [phraseId],
@@ -187,10 +205,40 @@ class PracticeRepository {
     );
   }
 
+  /// Set (or clear, with nulls) the R7 probe question for a phrase (audit item
+  /// 11): the [text] the user answers with the phrase, and an optional recorded
+  /// [clipPath] (AES-encrypted) played instead of TTS of the text.
+  Future<void> setProbeQuestion(int phraseId,
+      {String? text, String? clipPath}) async {
+    final db = await _db;
+    await db.update(
+      'practice_phrases',
+      {'probe_question_text': text, 'probe_question_clip_path': clipPath},
+      where: 'phrase_id = ?',
+      whereArgs: [phraseId],
+    );
+  }
+
+  /// Records (or clears, with null) a phrase's slow-spoken Sprechgesang clip
+  /// (audit item 15, scaffold). Until this is set, the phrase's Level-3 flow
+  /// stays unavailable (see `sprechgesangSatisfied`).
+  Future<void> setSprechgesangClip(int phraseId, String? clipPath) async {
+    final db = await _db;
+    await db.update(
+      'practice_phrases',
+      {'sprechgesang_clip_path': clipPath},
+      where: 'phrase_id = ?',
+      whereArgs: [phraseId],
+    );
+  }
+
   // --- Phase 3 progression state (per profile, per phrase) -----------------
 
-  /// The MIT progression record for (profile, phrase), or a fresh default
-  /// (R2 / tier 1 / 60 BPM) if none has been stored yet.
+  /// The MIT progression record for (profile, phrase), or a fresh default if none
+  /// has been stored yet. The default's **syllable tier is seeded from the
+  /// phrase's syllable count** (audit item 12, [levelForSyllableCount]) — a
+  /// longer phrase starts at a higher linguistic-load level — while the rung and
+  /// tempo take their usual defaults (R2 / 60 BPM).
   Future<ProgressionState> getProgressionState(
       String profileId, int phraseId) async {
     final db = await _db;
@@ -201,7 +249,18 @@ class PracticeRepository {
       limit: 1,
     );
     if (rows.isEmpty) {
-      return ProgressionState(profileId: profileId, phraseId: phraseId);
+      final phrase = await db.query('practice_phrases',
+          columns: ['syllable_count'],
+          where: 'phrase_id = ?',
+          whereArgs: [phraseId],
+          limit: 1);
+      final count =
+          phrase.isEmpty ? 0 : (phrase.first['syllable_count'] as int? ?? 0);
+      return ProgressionState(
+        profileId: profileId,
+        phraseId: phraseId,
+        syllableTier: levelForSyllableCount(count),
+      );
     }
     return ProgressionState.fromMap(rows.first);
   }
@@ -223,7 +282,8 @@ class PracticeRepository {
   }
 
   /// Per-session pass-rate history over solo rungs at or above [minRung]
-  /// (default 4 = r4–r6; the tier gate passes 6 for top-rung-only mastery),
+  /// (default 4 = r4–r7; the tier gate passes the top rung's level for top-rung-
+  /// only mastery),
   /// oldest → newest. Each entry is passes / (passes + fails) for that session,
   /// ignoring Unsure. With a [phraseId] it's that word's history (feeds the
   /// slow-loop tier gate, [MitProgression.shouldRaiseTier]); without one it's
@@ -296,12 +356,13 @@ class PracticeRepository {
     );
   }
 
-  /// Resets the whole ladder back to the start: every phrase to R0 and the
+  /// Resets the whole ladder back to the start: every phrase to the unison entry
+  /// ([entryRung] = R2 — tapping/humming are the warm-up, not word rungs) and the
   /// per-phrase tier/tempo cleared (so [getProgressionState] returns defaults).
   /// For starting a fresh run-through from the beginning of the progression.
   Future<void> resetProgression(String profileId) async {
     final db = await _db;
-    await db.update('practice_phrases', {'current_rung': Rung.r0.level});
+    await db.update('practice_phrases', {'current_rung': entryRung.level});
     await db.delete(
       'progression_state',
       where: 'profile_id = ?',
@@ -332,14 +393,44 @@ class PracticeRepository {
   }
 
   /// Only the phrases currently switched on — the ones a session will use.
+  ///
+  /// The caregiver's own words come first; starter-library words are
+  /// **deprioritized** (`is_starter ASC`) so they fill in behind, not ahead of,
+  /// what the caregiver added (Part 3, item 14). This is ordering only — it does
+  /// not touch any rung/progression decision.
   Future<List<PracticePhrase>> getActivePhrases() async {
     final db = await _db;
     final rows = await db.query(
       'practice_phrases',
       where: 'is_active = 1',
-      orderBy: 'complexity_level ASC, phrase_text ASC',
+      orderBy: 'is_starter ASC, complexity_level ASC, phrase_text ASC',
     );
     return rows.map(PracticePhrase.fromMap).toList();
+  }
+
+  /// Starter-library phrases whose bundled guide hasn't been installed yet
+  /// (guide_clip_path still NULL). Drives `StarterGuideInstaller` on launch.
+  Future<List<PracticePhrase>> getStarterPhrasesNeedingGuide() async {
+    final db = await _db;
+    final rows = await db.query(
+      'practice_phrases',
+      where: 'is_starter = 1 AND guide_clip_path IS NULL',
+      orderBy: 'phrase_id ASC',
+    );
+    return rows.map(PracticePhrase.fromMap).toList();
+  }
+
+  /// Points a phrase at an already-installed encrypted guide clip. Used by the
+  /// starter installer — the phrase's syllable/nuclei/stress metadata was already
+  /// seeded, so only the clip path is written here.
+  Future<void> attachGuideClipPath(int phraseId, String guideClipPath) async {
+    final db = await _db;
+    await db.update(
+      'practice_phrases',
+      {'guide_clip_path': guideClipPath},
+      where: 'phrase_id = ?',
+      whereArgs: [phraseId],
+    );
   }
 
   // --- Sessions & attempts -------------------------------------------------
@@ -368,6 +459,7 @@ class PracticeRepository {
     String? localEncryptedAudioPath,
     int? rungAtAttempt,
     int? tierAtAttempt,
+    int? tempoBpm,
   }) async {
     final db = await _db;
     final attemptId = _uuid.v4();
@@ -382,8 +474,68 @@ class PracticeRepository {
       'local_encrypted_audio_path': localEncryptedAudioPath,
       'rung_at_attempt': rungAtAttempt,
       'tier_at_attempt': tierAtAttempt,
+      'tempo_bpm': tempoBpm, // v20: beat reference at capture (item 16c)
     });
     return attemptId;
+  }
+
+  /// Persist the raw per-tap stream for one attempt (ML logging audit item 16a):
+  /// one `tap_events` row per [TapEvent], carrying its touch-down time, dwell, and
+  /// beat phase, tied to [attemptId]/[phraseId]/[sessionId]/[rung]. A no-op when
+  /// there were no taps. Batched into one round-trip. Unlike audio, these derived
+  /// features are never evicted — this is the fatigue detector's future input.
+  Future<void> insertTapEvents({
+    required String attemptId,
+    required int phraseId,
+    required String sessionId,
+    required int rung,
+    required List<TapEvent> taps,
+  }) async {
+    if (taps.isEmpty) return;
+    final db = await _db;
+    final batch = db.batch();
+    for (var i = 0; i < taps.length; i++) {
+      final t = taps[i];
+      batch.insert('tap_events', {
+        'tap_id': _uuid.v4(),
+        'attempt_id': attemptId,
+        'phrase_id': phraseId,
+        'session_id': sessionId,
+        'rung': rung,
+        'tap_index': i,
+        'down_ms': t.downMs,
+        'dwell_ms': t.dwellMs,
+        'beat_phase': t.phase,
+      });
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// The raw tap stream saved for [attemptId], in tap order. Used by tests and
+  /// (later) the fatigue detector's per-attempt read.
+  Future<List<StoredTapEvent>> getTapEvents(String attemptId) async {
+    final db = await _db;
+    final rows = await db.query(
+      'tap_events',
+      where: 'attempt_id = ?',
+      whereArgs: [attemptId],
+      orderBy: 'tap_index ASC',
+    );
+    return rows.map(StoredTapEvent.fromMap).toList();
+  }
+
+  /// Every tap made during [sessionId], in chronological order. This is the
+  /// per-session window the fatigue detector reads (dwell trend + inter-tap
+  /// interval variance across the session).
+  Future<List<StoredTapEvent>> getTapEventsForSession(String sessionId) async {
+    final db = await _db;
+    final rows = await db.query(
+      'tap_events',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+      orderBy: 'down_ms ASC',
+    );
+    return rows.map(StoredTapEvent.fromMap).toList();
   }
 
   /// Attempts that still have an audio clip recorded before [cutoffUtc] (a
@@ -416,9 +568,15 @@ class PracticeRepository {
   /// Persist the analysis output for one attempt into `acoustic_feature_vectors`
   /// (brief §5). Stores the gate verdict and, if the clip passed, its similarity
   /// score (null otherwise). Returns the new vector id.
+  /// [onsetMs] is the patient's own detected syllable onsets for this clip (item
+  /// 16c), stored as CSV so onset-vs-beat steadiness can be recomputed after the
+  /// audio is evicted; empty/absent when nothing was detected (e.g. a gate-
+  /// rejected clip). The DTW distance ([AnalysisResult.mfccDistance], item 16b)
+  /// is stored alongside the squashed similarity.
   Future<String> insertFeatureVector({
     required String attemptId,
     required AnalysisResult result,
+    List<int> onsetMs = const [],
   }) async {
     final db = await _db;
     final vectorId = _uuid.v4();
@@ -426,9 +584,11 @@ class PracticeRepository {
       'vector_id': vectorId,
       'attempt_id': attemptId,
       'content_similarity_score': result.contentSimilarityScore,
+      'mfcc_distance': result.mfccDistance,
       'gate_passed': result.gatePassed ? 1 : 0,
       'gate_reason': result.gateReason,
       'duration_ms': result.durationMs,
+      'onset_ms': onsetMs.isEmpty ? null : onsetMs.join(','),
     });
     return vectorId;
   }
@@ -556,7 +716,12 @@ class PracticeRepository {
       FROM exercise_attempts a
       JOIN practice_sessions s ON a.session_id = s.session_id
       LEFT JOIN acoustic_feature_vectors f ON f.attempt_id = a.attempt_id
-      WHERE s.profile_id = ? AND date(a.timestamp) = date('now')
+      -- A half-open range on the raw timestamp (not date(a.timestamp)=…) so the
+      -- idx_attempts_timestamp index is usable (item 22). Timestamps are stored
+      -- 'YYYY-MM-DD HH:MM:SS' UTC, so lexical ≥/< matches date-of-today.
+      WHERE s.profile_id = ?
+        AND a.timestamp >= date('now')
+        AND a.timestamp < date('now', '+1 day')
     ''', [profileId, profileId]);
   }
 

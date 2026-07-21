@@ -46,19 +46,24 @@ class AttemptAnalyzer {
         gatePassed: false,
         gateReason: gate.reason,
         contentSimilarityScore: null,
+        mfccDistance: null,
         durationMs: gate.durationMs,
         mfcc: const [],
       );
     }
 
     final mfcc = _mfcc.extract(samples);
-    final score =
-        anchorMfcc == null ? null : Dtw.similarity(mfcc, anchorMfcc);
+    // Keep BOTH the 0..1 similarity (display/gate) and the raw normalized DTW
+    // cost (the "MFCC distance", item 16b): the distance is the un-squashed
+    // signal an ML classifier wants, since similarity = 1/(1+cost) compresses
+    // large differences. Null when there's no template to align against.
+    final dtw = anchorMfcc == null ? null : Dtw.align(mfcc, anchorMfcc);
 
     return AnalysisResult(
       gatePassed: true,
       gateReason: gate.reason, // 'ok'
-      contentSimilarityScore: score,
+      contentSimilarityScore: dtw?.similarity,
+      mfccDistance: dtw?.normalizedCost,
       durationMs: gate.durationMs,
       mfcc: mfcc,
     );
@@ -73,6 +78,7 @@ class AnalysisResult {
     required this.gatePassed,
     required this.gateReason,
     required this.contentSimilarityScore,
+    required this.mfccDistance,
     required this.durationMs,
     required this.mfcc,
   });
@@ -86,6 +92,11 @@ class AnalysisResult {
   /// 0..1 similarity vs the supplied template. Null if the gate rejected the
   /// clip OR no template was supplied.
   final double? contentSimilarityScore;
+
+  /// Raw normalized DTW cost vs the template (0.0 = identical, larger = more
+  /// different) — the un-squashed distance behind [contentSimilarityScore], kept
+  /// for ML (item 16b). Null under the same conditions as the similarity.
+  final double? mfccDistance;
 
   /// Clip length in milliseconds (from the sample count).
   final int durationMs;

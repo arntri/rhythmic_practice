@@ -9,6 +9,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'starter_library.dart';
+
 /// Opens (and, on first run, creates + seeds) the local SQLite database.
 ///
 /// This is the lowest layer of the data stack. Nothing in here knows about the
@@ -72,7 +74,49 @@ class AppDatabase {
   // for live demonstrations — letting the presenter jump the current word to any
   // rung on demand. It changes only the in-session rung (never persisted to the
   // phrase's stored progression), so a demo can't disturb real therapy history.
-  static const _schemaVersion = 18;
+  // v19 added the tap_events table: the RAW per-tap stream (touch-down time +
+  // dwell + beat phase), one row per tap, tied to its attempt/phrase/rung. The
+  // aggregate tapping_synchronization_score alone can't reconstruct dwell or
+  // inter-tap-interval variance (the fatigue-detector inputs), and unlike audio
+  // this derived data is NOT evicted — it must be captured at session time or
+  // it's lost forever. (ML logging audit, Part 3 item 16a.)
+  // v20 enriched the per-attempt acoustic log (ML logging audit items 16b/16c):
+  // mfcc_distance + onset_ms on acoustic_feature_vectors (the raw DTW distance
+  // behind the squashed similarity, and the PATIENT's own detected syllable
+  // onsets), and tempo_bpm on exercise_attempts (the beat reference at capture
+  // time). Together these let vocal-rhythm steadiness (onset-vs-beat) be computed
+  // after the 48h audio eviction, which otherwise erases the only source.
+  // v21 added the response-to-a-question step (R7, audit item 11): a per-phrase
+  // probe_question_text and optional AES-encrypted probe_question_clip_path — the
+  // intoned/spoken question the app plays for the user to answer with the target
+  // phrase, solo, at the top rung.
+  // v22 added stress_index on practice_phrases (intonation flow, item A): the
+  // caregiver-designated syllable that carries the HIGH note. One human tap is the
+  // source of truth for "correct stress" — it drives the reference demo, the
+  // mis-stress check on the caregiver's recording, and the on-screen melody cue.
+  // v23 reconciles level with syllable count (audit item 12): recomputes
+  // practice_phrases.complexity_level from syllable_count (1–3→L1, 4–6→L2, 7+→L3),
+  // retiring the old wordCount>1?3:1 heuristic, and seeds progression_state
+  // .syllable_tier from the same count for words still at the default tier 1 (so
+  // a longer phrase starts at a higher linguistic-load level).
+  // v24 added solo_mode_enabled on user_profiles (audit item 19, scaffold): the
+  // caregiver switch for scoped solo practice. Default off; the ML never gates
+  // (solo mode is advisory-only until Layer C graduates — which it can't until a
+  // model is trained).
+  // v25 added (a) sprechgesang_clip_path on practice_phrases (audit item 15,
+  // scaffold): a separate caregiver-recorded slow-spoken (speech-song) clip;
+  // Level 3 stays unavailable until it exists. And (b) indexes that speed the
+  // daily-summary recompute (audit item 22): exercise_attempts(session_id),
+  // exercise_attempts(timestamp), practice_sessions(profile_id).
+  // v26 reconciles stored rungs to the refactored active word ladder [R2, R6]:
+  // tapping (R0) and humming (R1) are now the session WARM-UP (not per-word rungs)
+  // and R7 (answer-the-question) is deferred/off, so any legacy phrase or
+  // progression row parked at r0/r1 is bumped to unison (R2) and any at r7 clamped
+  // to solo (R6). No word ever sits on a warm-up or deferred rung again.
+  // v27 adds is_starter on practice_phrases (the starter word library, Part 3):
+  // ~10 phrases bundled with placeholder guides, seeded idempotently. The flag is
+  // presentation-only — it never branches practice logic (rungs/progression).
+  static const _schemaVersion = 27;
 
   // We hold onto the open connection once we've opened it.
   Database? _db;
@@ -230,6 +274,114 @@ class AppDatabase {
           'demo_mode_enabled INTEGER NOT NULL DEFAULT 0 '
           'CHECK(demo_mode_enabled IN (0,1))');
     }
+    if (oldVersion < 19 && newVersion >= 19) {
+      // Raw per-tap stream (ML logging audit item 16a). Same table is created
+      // inline for fresh installs in [_createSchema] / [_createTapEventsTable].
+      await _createTapEventsTable(db);
+    }
+    if (oldVersion < 20 && newVersion >= 20) {
+      // Enrich the per-attempt acoustic log (ML logging audit items 16b/16c).
+      // Same columns are created inline for fresh installs in [_createSchema].
+      // All NULL for pre-v20 rows (they were never captured, not zero).
+      //
+      // `acoustic_feature_vectors` is created by [_createAnalysisTables], which
+      // the v3 migration step also runs — so a v1/v2 → v20 upgrade builds the
+      // table already carrying these columns, while a v3–v19 → v20 upgrade has
+      // the older table and genuinely needs the ALTER. Guarding on the column's
+      // existence makes both paths correct (and is a no-op when already present).
+      await _addColumnIfMissing(
+          db, 'acoustic_feature_vectors', 'mfcc_distance', 'mfcc_distance REAL');
+      await _addColumnIfMissing(
+          db, 'acoustic_feature_vectors', 'onset_ms', 'onset_ms TEXT');
+      await _addColumnIfMissing(
+          db, 'exercise_attempts', 'tempo_bpm', 'tempo_bpm INTEGER');
+    }
+    if (oldVersion < 21 && newVersion >= 21) {
+      // Response-to-a-question step (R7, audit item 11): the per-phrase probe
+      // question (text + optional recorded clip). Same columns inline in
+      // [_createSchema]. NULL for phrases with no probe question set yet.
+      await _addColumnIfMissing(db, 'practice_phrases', 'probe_question_text',
+          'probe_question_text TEXT');
+      await _addColumnIfMissing(db, 'practice_phrases',
+          'probe_question_clip_path', 'probe_question_clip_path TEXT');
+    }
+    if (oldVersion < 22 && newVersion >= 22) {
+      // Caregiver-designated high-note syllable (intonation flow, item A). Same
+      // column inline in [_createSchema]. NULL until a guide is recorded with a
+      // confirmed contour.
+      await _addColumnIfMissing(
+          db, 'practice_phrases', 'stress_index', 'stress_index INTEGER');
+    }
+    if (oldVersion < 23 && newVersion >= 23) {
+      // Reconcile level with syllable count (audit item 12). The CASE mirrors
+      // [levelForSyllableCount]: 1–3→1, 4–6→2, 7+→3.
+      const levelExpr =
+          'CASE WHEN syllable_count <= 3 THEN 1 WHEN syllable_count <= 6 THEN 2 ELSE 3 END';
+      await db.execute(
+          'UPDATE practice_phrases SET complexity_level = $levelExpr');
+      // Seed each word's starting linguistic-load level from its syllable count,
+      // but only for words the tier gate has NOT already raised (still at the
+      // default tier 1) — so a longer phrase opens at a higher level while any
+      // gate-earned tier is left untouched.
+      await db.execute('''
+        UPDATE progression_state SET syllable_tier = (
+          SELECT CASE WHEN p.syllable_count <= 3 THEN 1
+                      WHEN p.syllable_count <= 6 THEN 2 ELSE 3 END
+          FROM practice_phrases p WHERE p.phrase_id = progression_state.phrase_id
+        )
+        WHERE syllable_tier = 1
+          AND phrase_id IN (SELECT phrase_id FROM practice_phrases)
+      ''');
+    }
+    if (oldVersion < 24 && newVersion >= 24) {
+      // Scoped solo-mode switch (audit item 19, scaffold; default off). Same
+      // column inline in [_createSchema].
+      await _addColumnIfMissing(db, 'user_profiles', 'solo_mode_enabled',
+          'solo_mode_enabled INTEGER NOT NULL DEFAULT 0 '
+          'CHECK(solo_mode_enabled IN (0,1))');
+    }
+    if (oldVersion < 25 && newVersion >= 25) {
+      // (a) Sprechgesang slow-spoken clip (audit item 15, scaffold). Same column
+      // inline in [_createSchema]. NULL until a caregiver records one.
+      await _addColumnIfMissing(db, 'practice_phrases', 'sprechgesang_clip_path',
+          'sprechgesang_clip_path TEXT');
+      // (b) Daily-summary read indexes (audit item 22): the per-attempt rollup
+      // recompute joins attempts→sessions and filters by day; these make it a pair
+      // of index lookups instead of full scans as history grows. Same indexes are
+      // created for fresh installs in [_createDailySummaryReadIndexes].
+      await _createDailySummaryReadIndexes(db);
+    }
+    if (oldVersion < 26 && newVersion >= 26) {
+      // Progression refactor: clamp stored rungs to the active word ladder
+      // [R2, R6]. R0/R1 are now the session warm-up and R7 is deferred, so no word
+      // may sit there. Bump r0/r1 → R2 (unison entry); clamp r7 → R6 (solo).
+      for (final table in ['practice_phrases', 'progression_state']) {
+        await db.execute('UPDATE $table SET current_rung = 2 '
+            'WHERE current_rung < 2');
+        await db.execute('UPDATE $table SET current_rung = 6 '
+            'WHERE current_rung > 6');
+      }
+    }
+    if (oldVersion < 27 && newVersion >= 27) {
+      // Starter word library (Part 3): the is_starter flag, then seed the library
+      // for existing installs. Same column inline in [_createSchema]; the seed is
+      // idempotent (guarded on the flag) so it never double-inserts.
+      await _addColumnIfMissing(db, 'practice_phrases', 'is_starter',
+          'is_starter INTEGER CHECK(is_starter IN (0,1)) DEFAULT 0');
+      await _seedStarters(db);
+    }
+  }
+
+  /// `ALTER TABLE … ADD COLUMN` only when [column] isn't already on [table].
+  /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and some shared table-creators run
+  /// during migrations already carrying newer columns, so an unguarded ALTER can
+  /// hit "duplicate column name" on certain upgrade paths. [ddl] is the column
+  /// definition (e.g. `'tempo_bpm INTEGER'`).
+  static Future<void> _addColumnIfMissing(
+      Database db, String table, String column, String ddl) async {
+    final cols = await db.rawQuery('PRAGMA table_info($table)');
+    final exists = cols.any((c) => c['name'] == column);
+    if (!exists) await db.execute('ALTER TABLE $table ADD COLUMN $ddl');
   }
 
   // --- Schema (Phase 1 subset, matching the build brief §6) ----------------
@@ -240,6 +392,7 @@ class AppDatabase {
   static Future<void> applyInitialSchema(Database db) async {
     await _createSchema(db);
     await _seed(db);
+    await _seedStarters(db);
   }
 
   static Future<void> _createSchema(Database db) async {
@@ -263,7 +416,8 @@ class AppDatabase {
         target_display           TEXT CHECK(target_display IN ('picture','word','both')) DEFAULT 'picture',  -- how the word is shown
         playback_speed           REAL NOT NULL DEFAULT 1.0,  -- caregiver guide-speed multiplier (lower = slower)
         session_rung_cap         INTEGER,  -- caregiver comfort cap: max rung the auto-progression may reach (NULL = no cap)
-        demo_mode_enabled        INTEGER CHECK(demo_mode_enabled IN (0,1)) DEFAULT 0  -- presenter in-session level picker on/off
+        demo_mode_enabled        INTEGER CHECK(demo_mode_enabled IN (0,1)) DEFAULT 0,  -- presenter in-session level picker on/off
+        solo_mode_enabled        INTEGER CHECK(solo_mode_enabled IN (0,1)) DEFAULT 0  -- scoped solo practice on/off (item 19, scaffold; advisory-only)
       )
     ''');
 
@@ -277,9 +431,14 @@ class AppDatabase {
         audio_asset_path TEXT,                    -- bundled fallback clip (rarely used)
         guide_clip_path  TEXT,                    -- AES-encrypted recorded guide = DTW reference
         guide_nuclei_ms  TEXT,                    -- CSV of confirmed syllable-nucleus timestamps (ms)
-        current_rung     INTEGER NOT NULL DEFAULT 2,  -- MIT support/task ladder rung (0-6)
+        current_rung     INTEGER NOT NULL DEFAULT 2,  -- MIT support/task ladder rung (0-7)
         photo_path       TEXT,                     -- AES-encrypted photo for name cards (§6)
-        is_active        INTEGER CHECK(is_active IN (0,1)) DEFAULT 1
+        probe_question_text       TEXT,           -- v21: the R7 probe question the user answers with the phrase
+        probe_question_clip_path  TEXT,           -- v21: AES-encrypted recorded probe question (TTS fallback on the text)
+        stress_index     INTEGER,                  -- v22: caregiver-designated HIGH-note syllable (intonation flow)
+        sprechgesang_clip_path    TEXT,            -- v25: slow-spoken speech-song clip (item 15, scaffold; L3 needs it)
+        is_active        INTEGER CHECK(is_active IN (0,1)) DEFAULT 1,
+        is_starter       INTEGER CHECK(is_starter IN (0,1)) DEFAULT 0  -- v27: starter word library (Part 3); presentation-only, never branches practice logic
       )
     ''');
 
@@ -308,6 +467,7 @@ class AppDatabase {
         support_level                 INTEGER NOT NULL DEFAULT 2 CHECK(support_level IN (1,2,3,4)),
         rung_at_attempt               INTEGER,  -- Phase 3: MIT rung (0-6) this attempt was produced at (NULL pre-v8)
         tier_at_attempt               INTEGER,  -- Phase 3: syllable tier this attempt was produced at (NULL pre-v16)
+        tempo_bpm                     INTEGER,  -- v20: metronome tempo at capture (beat reference for onset-vs-beat; NULL pre-v20)
         FOREIGN KEY (session_id) REFERENCES practice_sessions(session_id) ON DELETE CASCADE,
         FOREIGN KEY (phrase_id)  REFERENCES practice_phrases(phrase_id)
       )
@@ -316,6 +476,54 @@ class AppDatabase {
     await _createAnalysisTables(db);
     await _createProgressionTable(db);
     await _createDailySummaryTable(db);
+    await _createTapEventsTable(db);
+    await _createDailySummaryReadIndexes(db);
+  }
+
+  /// Indexes that speed the daily-summary recompute (audit item 22). The rollup
+  /// runs after every saved attempt and joins `exercise_attempts` → `practice_
+  /// sessions`, filtering by profile and a one-day timestamp range. Without these
+  /// it is a full scan of every attempt ever made; with them it is a pair of
+  /// index range lookups. Shared by fresh installs (above) and the v25 upgrade.
+  static Future<void> _createDailySummaryReadIndexes(Database db) async {
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_attempts_session '
+        'ON exercise_attempts(session_id)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_attempts_timestamp '
+        'ON exercise_attempts(timestamp)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_sessions_profile '
+        'ON practice_sessions(profile_id)');
+  }
+
+  /// The raw per-tap stream (ML logging audit item 16a): one row per tap, tied to
+  /// the attempt/phrase/rung it belongs to. Stores the monotonic touch-down time,
+  /// the press dwell (touch-down→up, NULL if the release was never observed), and
+  /// the metronome phase at touch-down. This is the un-aggregated data the fatigue
+  /// detector needs — dwell trend + inter-tap-interval variance — which the single
+  /// `tapping_synchronization_score` on the attempt row cannot reconstruct.
+  ///
+  /// Unlike attempt audio, these are derived non-audio features, so the 48h audio
+  /// eviction never touches them: the fine-grained stream is kept for later ML.
+  /// Indexed by attempt (per-attempt read) and session (per-window fatigue read).
+  static Future<void> _createTapEventsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE tap_events (
+        tap_id      TEXT PRIMARY KEY NOT NULL,
+        attempt_id  TEXT NOT NULL,
+        phrase_id   INTEGER NOT NULL,
+        session_id  TEXT NOT NULL,
+        rung        INTEGER NOT NULL,   -- MIT rung (0-6) the tap was produced at
+        tap_index   INTEGER NOT NULL,   -- 0-based order within the attempt
+        down_ms     INTEGER NOT NULL,   -- monotonic touch-down time (ms since session start)
+        dwell_ms    INTEGER,            -- press duration (touch-down→up); NULL if no release seen
+        beat_phase  REAL,               -- metronome phase at touch-down (0..1); NULL if unknown
+        FOREIGN KEY (attempt_id) REFERENCES exercise_attempts(attempt_id) ON DELETE CASCADE,
+        FOREIGN KEY (phrase_id)  REFERENCES practice_phrases(phrase_id)
+      )
+    ''');
+    await db.execute(
+        'CREATE INDEX idx_tap_events_attempt ON tap_events(attempt_id)');
+    await db.execute(
+        'CREATE INDEX idx_tap_events_session ON tap_events(session_id)');
   }
 
   /// Per-(profile, day) metrics rollup: attempt counts, the Pass/Fail/Unsure
@@ -368,9 +576,11 @@ class AppDatabase {
         vector_id                TEXT PRIMARY KEY NOT NULL,
         attempt_id               TEXT NOT NULL UNIQUE,
         content_similarity_score REAL,
+        mfcc_distance            REAL,     -- v20: raw normalized DTW cost behind the similarity (item 16b)
         gate_passed              INTEGER CHECK(gate_passed IN (0,1)) NOT NULL,
         gate_reason              TEXT,
         duration_ms              INTEGER,
+        onset_ms                 TEXT,     -- v20: CSV of the patient's detected syllable onsets, ms (item 16c)
         FOREIGN KEY (attempt_id) REFERENCES exercise_attempts(attempt_id) ON DELETE CASCADE
       )
     ''');
@@ -411,43 +621,79 @@ class AppDatabase {
     await db.insert('user_profiles', {'profile_id': defaultProfileId});
 
     // Starter phrases. Each tuple is:
-    //   [text, word_count, syllable_count, complexity_level]
-    // complexity_level follows the brief's grouping (1/2/3). Note: a couple of
-    // the brief's level-1/level-2 words actually have an extra spoken syllable
-    // (e.g. "Water" = 2, "Medicine" = 3), so syllable_count reflects the true
-    // count while complexity_level keeps the brief's intended grouping.
+    //   [text, word_count, syllable_count, is_active]
+    // complexity_level is DERIVED from syllable_count (audit item 12,
+    // levelForSyllableCount: 1–3→L1, 4–6→L2, 7+→L3) rather than hand-assigned, so
+    // a phrase's level always matches its real syllable count. Most starter words
+    // are short (L1); two longer phrases seed L2/L3 examples. is_active is explicit
+    // (a small single-syllable starter set is on) — it's no longer tied to level,
+    // since under the syllable-count mapping nearly every short word is L1.
     const seedPhrases = <List<Object>>[
-      // Level 1 — single-syllable words
+      // Single-syllable core words (active by default → a short first session).
       ['Help', 1, 1, 1],
       ['Pain', 1, 1, 1],
       ['More', 1, 1, 1],
       ['Stop', 1, 1, 1],
       ['Water', 1, 2, 1],
-      // Level 2 — two-syllable words
-      ['Bathroom', 1, 2, 2],
-      ['Hungry', 1, 2, 2],
-      ['Medicine', 1, 3, 2],
-      ['Sleepy', 1, 2, 2],
-      ['Thank you', 2, 2, 2],
-      // Level 3 — short phrases
-      ['I want food', 3, 3, 3],
-      ['Sit down', 2, 2, 3],
-      ['I love you', 3, 3, 3],
+      // Short words (L1), off by default — the caregiver enables them as ready.
+      ['Bathroom', 1, 2, 0],
+      ['Hungry', 1, 2, 0],
+      ['Medicine', 1, 3, 0],
+      ['Sleepy', 1, 2, 0],
+      ['Thank you', 2, 2, 0],
+      ['I want food', 3, 3, 0],
+      ['Sit down', 2, 2, 0],
+      ['I love you', 3, 3, 0],
+      // Longer phrases so L2 / L3 exist out of the box (off by default).
+      ['Can you help me', 4, 4, 0], // 4 syllables → L2
+      ['I would like to go home now', 7, 7, 0], // 7 syllables → L3
     ];
 
-    // A batch sends all inserts in one trip for speed. Only the level-1 starter
-    // words are active by default, so a first session is short and intentional
-    // (~5 words); the caregiver enables more from settings as the user is ready.
+    // A batch sends all inserts in one trip for speed. Only the single-syllable
+    // starter words are active by default, so a first session is short and
+    // intentional (~5 words); the caregiver enables more from settings.
     final batch = db.batch();
     for (final row in seedPhrases) {
-      final level = row[3] as int;
+      final syllables = row[2] as int;
+      // Mirror levelForSyllableCount (kept inline to avoid a data→practice import).
+      final level = syllables <= 3 ? 1 : (syllables <= 6 ? 2 : 3);
       batch.insert('practice_phrases', {
         'phrase_text': row[0],
         'word_count': row[1],
-        'syllable_count': row[2],
+        'syllable_count': syllables,
         'complexity_level': level,
         'audio_asset_path': null, // filled in when we add the audio guide
-        'is_active': level == 1 ? 1 : 0,
+        'is_active': row[3],
+      });
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// Seeds the starter word library (Part 3) — idempotently. Only inserts when no
+  /// starter rows exist yet, so it's safe on both a fresh install and the v27
+  /// upgrade, and a no-op on every later launch. The bundled guide clip itself is
+  /// installed at runtime by `StarterGuideInstaller` (it needs the per-install
+  /// encryption key + filesystem); here we seed only the phrase metadata.
+  static Future<void> _seedStarters(Database db) async {
+    final rows = await db.rawQuery(
+        'SELECT COUNT(*) AS n FROM practice_phrases WHERE is_starter = 1');
+    final existing = (rows.first['n'] as int?) ?? 0;
+    if (existing > 0) return;
+
+    final batch = db.batch();
+    for (final s in starterLibrary) {
+      // Only columns guaranteed on both fresh and v1-upgraded schemas — the
+      // seeder also runs from the v27 migration, where audio_asset_path (a
+      // fresh-install-only column) doesn't exist. It's nullable regardless.
+      batch.insert('practice_phrases', {
+        'phrase_text': s.text,
+        'word_count': s.wordCount,
+        'syllable_count': s.syllableCount,
+        'complexity_level': s.complexityLevel,
+        'guide_nuclei_ms': s.nucleiMs.join(','),
+        'stress_index': s.stressIndex,
+        'is_active': s.activeByDefault ? 1 : 0,
+        'is_starter': 1,
       });
     }
     await batch.commit(noResult: true);

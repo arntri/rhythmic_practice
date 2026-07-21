@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'app/orientation.dart';
 import 'data/practice_repository.dart';
 import 'screens/home_screen.dart';
 import 'services/audio_eviction.dart';
+import 'services/starter_installer.dart';
 import 'services/sync_service.dart';
 import 'services/cloud.dart';
 import 'theme.dart';
@@ -14,12 +16,10 @@ Future<void> main() async {
   // runApp().
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Lock the whole app to landscape, both ways up. The brief calls for a
-  // landscape-locked, hands-free layout.
-  await SystemChrome.setPreferredOrientations(const [
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
-  ]);
+  // Start landscape (the patient's home + practice surface). Caregiver setup
+  // pages flip to portrait on push via [OrientationRouteObserver]; see
+  // app/orientation.dart.
+  await SystemChrome.setPreferredOrientations(kLandscapeOrientations);
 
   // Connect to Supabase if credentials are configured. This never throws — if
   // the cloud is absent or unreachable the app still runs fully locally.
@@ -29,6 +29,14 @@ Future<void> main() async {
   // the background; failures must never block app start.
   AudioEvictionService(PracticeRepository()).evictExpired().catchError((Object e) {
     debugPrint('Audio eviction failed: $e');
+    return 0;
+  });
+
+  // Install the starter word library's bundled guide clips (Part 3). Idempotent
+  // and best-effort — a failure just leaves those phrases needing a guide, and it
+  // never blocks startup.
+  StarterGuideInstaller().installMissing().catchError((Object e) {
+    debugPrint('Starter guide install failed: $e');
     return 0;
   });
 
@@ -74,6 +82,7 @@ class _RhythmicPracticeAppState extends State<RhythmicPracticeApp>
       title: 'Rhythmic Practice',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
+      navigatorObservers: [OrientationRouteObserver()],
       home: const HomeScreen(),
     );
   }

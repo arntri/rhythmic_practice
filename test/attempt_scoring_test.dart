@@ -55,6 +55,7 @@ void main() {
   AttemptScoring scorer(Map<String, Uint8List> clips) => AttemptScoring(
         repo: repo,
         decryptor: (path) async => clips[path]!,
+        runInIsolate: false, // inline + deterministic for tests
       );
 
   test('a Pass attempt is scored and promoted to the phrase anchor', () async {
@@ -76,6 +77,11 @@ void main() {
     expect(fv!.gatePassed, isTrue);
     expect(fv.contentSimilarityScore, isNotNull);
     expect(fv.contentSimilarityScore, inInclusiveRange(0.0, 1.0));
+    // Item 16b: the raw DTW distance is stored alongside the similarity.
+    expect(fv.mfccDistance, isNotNull);
+    expect(fv.mfccDistance, greaterThanOrEqualTo(0.0));
+    // Item 16c: patient onsets are a (possibly empty) list, never null-crashing.
+    expect(fv.onsetMs, isA<List<int>>());
 
     // Pass + clean → anchor promoted.
     expect(await repo.getAnchor(AppDatabase.defaultProfileId, phraseId), isNotNull);
@@ -115,5 +121,29 @@ void main() {
     expect(fv!.gatePassed, isFalse);
     expect(fv.contentSimilarityScore, isNull);
     expect(await repo.getAnchor(AppDatabase.defaultProfileId, phraseId), isNull);
+  });
+
+  test('the off-thread isolate path (item 21) scores the same as inline',
+      () async {
+    final id = await newAttempt(1);
+    // runInIsolate defaults to true → the CPU pipeline runs via compute().
+    final s = AttemptScoring(
+      repo: repo,
+      decryptor: (path) async =>
+          {'attempt.wav': tone(1, 0.3), 'guide.wav': tone(1, 0.3)}[path]!,
+    );
+    final stored = await s.scoreAttempt(
+      attemptId: id,
+      phraseId: phraseId,
+      profileId: AppDatabase.defaultProfileId,
+      encryptedAttemptPath: 'attempt.wav',
+      guideClipPath: 'guide.wav',
+      evaluationLabel: 1,
+    );
+    expect(stored, isTrue);
+    final fv = await repo.getFeatureVector(id);
+    expect(fv, isNotNull);
+    expect(fv!.gatePassed, isTrue);
+    expect(fv.contentSimilarityScore, inInclusiveRange(0.0, 1.0));
   });
 }

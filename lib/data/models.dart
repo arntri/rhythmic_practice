@@ -43,9 +43,36 @@ class PracticePhrase {
   /// photo + recorded name). Null for an ordinary word/phrase.
   final String? photoPath;
 
+  /// The R7 probe question (audit item 11): the intoned/spoken question the app
+  /// plays for the user to answer with [phraseText], solo, at the top rung. Null
+  /// until the caregiver sets one — R7 then degrades to a gentle generic prompt.
+  final String? probeQuestionText;
+
+  /// AES-encrypted recorded probe question for R7. Null → the guide falls back to
+  /// TTS of [probeQuestionText] (or, absent that, a gentle generic prompt).
+  final String? probeQuestionClipPath;
+
+  /// The caregiver-designated syllable that carries the HIGH note (intonation
+  /// flow, item A) — 0-based index into the confirmed syllables. Null until a
+  /// guide with a confirmed contour is recorded. Drives the reference demo, the
+  /// mis-stress check, and the on-screen melody cue.
+  final int? stressIndex;
+
+  /// AES-encrypted, caregiver-recorded **slow-spoken (Sprechgesang) clip** (audit
+  /// item 15, scaffold): the speech-song bridge between full intonation and normal
+  /// speech used at Level 3. Null until recorded — while null, a phrase cannot use
+  /// its L3 flow ([sprechgesangSatisfied]).
+  final String? sprechgesangClipPath;
+
   /// Whether this phrase is included in practice sessions. The caregiver can
   /// toggle phrases on/off from the settings portal later.
   final bool isActive;
+
+  /// True for a bundled **starter-library** phrase (Part 3). Presentation-only —
+  /// it exempts the guide clip from mention in eviction and deprioritizes the
+  /// phrase below the caregiver's own words; it MUST NOT affect rungs, judging,
+  /// or any progression decision.
+  final bool isStarter;
 
   const PracticePhrase({
     required this.phraseId,
@@ -58,11 +85,19 @@ class PracticePhrase {
     this.guideNucleiMs = const [],
     this.rung = Rung.r2,
     this.photoPath,
+    this.probeQuestionText,
+    this.probeQuestionClipPath,
+    this.stressIndex,
+    this.sprechgesangClipPath,
     required this.isActive,
+    this.isStarter = false,
   });
 
   /// True once a recorded guide exists for this phrase.
   bool get hasRecordedGuide => guideClipPath != null;
+
+  /// True once a slow-spoken Sprechgesang clip exists (audit item 15).
+  bool get hasSprechgesangClip => sprechgesangClipPath != null;
 
   /// True when this is a name card with a photo attached.
   bool get hasPhoto => photoPath != null;
@@ -82,7 +117,12 @@ class PracticePhrase {
           : nucleiCsv.split(',').map(int.parse).toList(),
       rung: rungFromLevel((row['current_rung'] as int?) ?? 2),
       photoPath: row['photo_path'] as String?,
+      probeQuestionText: row['probe_question_text'] as String?,
+      probeQuestionClipPath: row['probe_question_clip_path'] as String?,
+      stressIndex: row['stress_index'] as int?,
+      sprechgesangClipPath: row['sprechgesang_clip_path'] as String?,
       isActive: (row['is_active'] as int) == 1,
+      isStarter: (row['is_starter'] as int? ?? 0) == 1,
     );
   }
 }
@@ -154,6 +194,16 @@ class ExerciseAttempt {
   /// (Step 8), or until the mic (Step 5) records one.
   final String? localEncryptedAudioPath;
 
+  /// MIT rung this attempt was produced at (0–7); null pre-v8. Context for the
+  /// Layer C feature assembly (audit item 18).
+  final int? rungAtAttempt;
+
+  /// Syllable tier at attempt time; null pre-v16.
+  final int? tierAtAttempt;
+
+  /// Metronome tempo (BPM) this attempt was produced at; null pre-v20.
+  final int? tempoBpm;
+
   const ExerciseAttempt({
     required this.attemptId,
     required this.sessionId,
@@ -164,6 +214,9 @@ class ExerciseAttempt {
     required this.tappingSynchronizationScore,
     required this.evaluationLabel,
     required this.localEncryptedAudioPath,
+    this.rungAtAttempt,
+    this.tierAtAttempt,
+    this.tempoBpm,
   });
 
   factory ExerciseAttempt.fromMap(Map<String, Object?> row) {
@@ -178,6 +231,9 @@ class ExerciseAttempt {
           (row['tapping_synchronization_score'] as num?)?.toDouble(),
       evaluationLabel: row['evaluation_label'] as int,
       localEncryptedAudioPath: row['local_encrypted_audio_path'] as String?,
+      rungAtAttempt: row['rung_at_attempt'] as int?,
+      tierAtAttempt: row['tier_at_attempt'] as int?,
+      tempoBpm: row['tempo_bpm'] as int?,
     );
   }
 }
@@ -288,6 +344,11 @@ class UserProfile {
   /// progression — so demonstrating can't disturb real therapy history.
   final bool demoModeEnabled;
 
+  /// Scoped solo practice (audit item 19, scaffold). Off by default. Even when
+  /// on, solo mode is advisory-only — the ML never gates progression until the
+  /// Layer C classifier graduates (which it can't until a model is trained).
+  final bool soloModeEnabled;
+
   const UserProfile({
     required this.profileId,
     required this.metronomeBpm,
@@ -304,6 +365,7 @@ class UserProfile {
     this.playbackSpeed = 1.0,
     this.sessionRungCap,
     this.demoModeEnabled = false,
+    this.soloModeEnabled = false,
   });
 
   factory UserProfile.fromMap(Map<String, Object?> row) {
@@ -323,6 +385,7 @@ class UserProfile {
       playbackSpeed: (row['playback_speed'] as num?)?.toDouble() ?? 1.0,
       sessionRungCap: row['session_rung_cap'] as int?,
       demoModeEnabled: ((row['demo_mode_enabled'] as int?) ?? 0) == 1,
+      soloModeEnabled: ((row['solo_mode_enabled'] as int?) ?? 0) == 1,
     );
   }
 }
@@ -334,28 +397,45 @@ class FeatureVector {
   final String vectorId;
   final String attemptId;
   final double? contentSimilarityScore;
+
+  /// Raw normalized DTW cost behind [contentSimilarityScore] (item 16b); null
+  /// when the gate rejected the clip or no template existed.
+  final double? mfccDistance;
+
   final bool gatePassed;
   final String? gateReason;
   final int? durationMs;
+
+  /// The patient's own detected syllable onsets (ms from clip start) for this
+  /// attempt (item 16c) — the material for onset-vs-beat vocal steadiness, kept
+  /// past audio eviction. Empty when none were detected.
+  final List<int> onsetMs;
 
   const FeatureVector({
     required this.vectorId,
     required this.attemptId,
     required this.contentSimilarityScore,
+    required this.mfccDistance,
     required this.gatePassed,
     required this.gateReason,
     required this.durationMs,
+    this.onsetMs = const [],
   });
 
   factory FeatureVector.fromMap(Map<String, Object?> row) {
+    final onsetCsv = row['onset_ms'] as String?;
     return FeatureVector(
       vectorId: row['vector_id'] as String,
       attemptId: row['attempt_id'] as String,
       contentSimilarityScore:
           (row['content_similarity_score'] as num?)?.toDouble(),
+      mfccDistance: (row['mfcc_distance'] as num?)?.toDouble(),
       gatePassed: (row['gate_passed'] as int) == 1,
       gateReason: row['gate_reason'] as String?,
       durationMs: row['duration_ms'] as int?,
+      onsetMs: (onsetCsv == null || onsetCsv.isEmpty)
+          ? const []
+          : onsetCsv.split(',').map(int.parse).toList(),
     );
   }
 }
@@ -387,4 +467,46 @@ class AnchorTemplate {
     required this.sourceAttemptId,
     required this.confirmedAt,
   });
+}
+
+/// One stored row of `tap_events` (ML logging audit item 16a): a single raw tap,
+/// tied to the attempt/phrase/rung it was made at. [downMs] is the monotonic
+/// touch-down time (ms since the session's controller started), [dwellMs] the
+/// press duration (null if the finger-up was never observed), [beatPhase] the
+/// metronome phase at touch-down. The read side for the fatigue detector and
+/// tests; the write side takes the controller's lightweight `TapEvent`.
+class StoredTapEvent {
+  final String tapId;
+  final String attemptId;
+  final int phraseId;
+  final String sessionId;
+  final int rung;
+  final int tapIndex;
+  final int downMs;
+  final int? dwellMs;
+  final double? beatPhase;
+
+  const StoredTapEvent({
+    required this.tapId,
+    required this.attemptId,
+    required this.phraseId,
+    required this.sessionId,
+    required this.rung,
+    required this.tapIndex,
+    required this.downMs,
+    required this.dwellMs,
+    required this.beatPhase,
+  });
+
+  factory StoredTapEvent.fromMap(Map<String, Object?> row) => StoredTapEvent(
+        tapId: row['tap_id'] as String,
+        attemptId: row['attempt_id'] as String,
+        phraseId: row['phrase_id'] as int,
+        sessionId: row['session_id'] as String,
+        rung: row['rung'] as int,
+        tapIndex: row['tap_index'] as int,
+        downMs: row['down_ms'] as int,
+        dwellMs: row['dwell_ms'] as int?,
+        beatPhase: (row['beat_phase'] as num?)?.toDouble(),
+      );
 }

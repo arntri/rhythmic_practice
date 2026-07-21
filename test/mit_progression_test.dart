@@ -22,7 +22,7 @@ void main() {
         syllableTier: tier,
       );
 
-  group('fast loop — 3-rep block at judged rungs (r4–r6)', () {
+  group('fast loop — 3-rep block at judged rungs (r4–r7)', () {
     test('≥2 Passes in the block advances one rung, resets tempo + backed-up', () {
       final r = engine.evaluateBlock(
           st(Rung.r4, bpm: 40, backedUp: true), [1, 0, 1]); // 2 passes
@@ -32,9 +32,16 @@ void main() {
       expect(r.state.backedUp, isFalse);
     });
 
-    test('a passing block at the top rung stays at r6', () {
+    test('a passing block at the top rung stays at the top (clamped at R6)', () {
+      final r = engine.evaluateBlock(st(topRung), [1, 1, 1]);
+      expect(topRung, Rung.r6);
+      expect(r.state.rung, topRung); // R6 — raisedActive clamps at the active top
+    });
+
+    test('a passing block at R6 never advances into the deferred R7', () {
       final r = engine.evaluateBlock(st(Rung.r6), [1, 1, 1]);
-      expect(r.state.rung, Rung.r6);
+      expect(r.state.rung, Rung.r6); // stays at solo; R7 is off
+      expect(r.state.rung, isNot(Rung.r7));
     });
 
     test('a failing block lowers the tempo first when above the floor', () {
@@ -80,31 +87,32 @@ void main() {
     });
   });
 
-  group('fast loop — r0 (the only un-judged rung) auto-proceeds', () {
-    test('r0 auto-proceeds to r1 regardless of the labels', () {
-      final r = engine.evaluateBlock(st(Rung.r0), [0, 0, 0]); // labels ignored
-      expect(r.outcome, RungOutcome.autoProceeded);
-      expect(r.state.rung, Rung.r1);
+  group('fast loop — warm-up rungs (r0/r1) auto-proceed; r2 is the judged floor',
+      () {
+    test('warm-up rungs auto-proceed regardless of the labels (safety net)', () {
+      // r0/r1 are never real word rungs, but if one is fed in it auto-proceeds
+      // (it is not judged) rather than easing support.
+      expect(engine.evaluateBlock(st(Rung.r0), [0, 0, 0]).outcome,
+          RungOutcome.autoProceeded);
+      expect(engine.evaluateBlock(st(Rung.r1), [0, 0, 0]).outcome,
+          RungOutcome.autoProceeded);
     });
 
-    test('r1 and r2 are now JUDGED, not auto-proceeded', () {
-      // A fail-majority block at r1/r2 must NOT auto-proceed — it eases support.
-      for (final rung in [Rung.r1, Rung.r2]) {
-        final r = engine.evaluateBlock(st(rung, bpm: 40), [0, 0, 1]);
-        expect(r.outcome, isNot(RungOutcome.autoProceeded), reason: '$rung');
-        expect(r.state.rung.level, lessThan(rung.level), reason: '$rung backs up');
-      }
+    test('r2 (unison) IS judged — a fail-majority block eases support', () {
+      // Above the tempo floor it slows the tempo; it never auto-proceeds.
+      final r = engine.evaluateBlock(st(Rung.r2, bpm: 60), [0, 0, 1]);
+      expect(r.outcome, isNot(RungOutcome.autoProceeded));
+      expect(r.outcome, RungOutcome.slowedTempo);
     });
 
-    test('≥2 Pass at r1/r2 advances one rung', () {
-      expect(engine.evaluateBlock(st(Rung.r1), [1, 1, 0]).state.rung, Rung.r2);
+    test('a failing r2 block at the tempo floor stays at unison (the floor)', () {
+      // Backing up clamps at R2 — there is no word rung below unison.
+      final r = engine.evaluateBlock(st(Rung.r2, bpm: 40), [0, 0, 0]);
+      expect(r.state.rung, Rung.r2);
+    });
+
+    test('≥2 Pass at r2 advances to r3', () {
       expect(engine.evaluateBlock(st(Rung.r2), [1, 1, 0]).state.rung, Rung.r3);
-    });
-
-    test('backing up from r1 lands on r0 (no-trap: r0 then always promotes)', () {
-      final r = engine.evaluateBlock(st(Rung.r1, bpm: 40), [0, 0, 0]);
-      expect(r.outcome, RungOutcome.backedUp);
-      expect(r.state.rung, Rung.r0);
     });
   });
 
@@ -135,12 +143,13 @@ void main() {
   });
 
   group('invariants', () {
-    test('a 3-pass block never demotes — advances exactly +1, every rung', () {
-      for (final rung in Rung.values) {
+    test('a 3-pass block never demotes — advances exactly +1, every word rung',
+        () {
+      for (final rung in activeLadder) {
         final r = engine.evaluateBlock(st(rung), [1, 1, 1]);
         // Never below the starting rung (passes must not demote).
         expect(r.state.rung.level >= rung.level, isTrue, reason: '$rung');
-        // Moves at most one step up.
+        // Moves at most one step up (R6 stays at R6 — clamped, never into R7).
         expect(r.state.rung.level - rung.level <= 1, isTrue, reason: '$rung');
       }
     });
@@ -184,27 +193,27 @@ void main() {
     });
   });
 
-  group('slow loop — syllable-tier gate (default 90% over 5 sessions)', () {
-    test('default window/threshold are 5 sessions @ 0.9', () {
-      expect(engine.tierWindow, 5);
+  group('slow loop — syllable-tier gate (default 90% over 10 sessions)', () {
+    test('default window/threshold are 10 sessions @ 0.9', () {
+      expect(engine.tierWindow, 10);
       expect(engine.tierPassRate, 0.9);
     });
 
-    test('fires only at ≥90% over the last 5 sessions', () {
-      expect(engine.shouldRaiseTier(List.filled(5, 1.0)), isTrue);
-      expect(engine.shouldRaiseTier(List.filled(5, 0.8)), isFalse);
+    test('fires only at ≥90% over the last 10 sessions', () {
+      expect(engine.shouldRaiseTier(List.filled(10, 1.0)), isTrue);
+      expect(engine.shouldRaiseTier(List.filled(10, 0.8)), isFalse);
     });
 
-    test('does not fire before the window (5) is full', () {
-      expect(engine.shouldRaiseTier(List.filled(4, 1.0)), isFalse);
+    test('does not fire before the window (10) is full', () {
+      expect(engine.shouldRaiseTier(List.filled(9, 1.0)), isFalse);
     });
 
     test('exactly 90% average over the window fires', () {
-      expect(engine.shouldRaiseTier(List.filled(5, 0.9)), isTrue);
+      expect(engine.shouldRaiseTier(List.filled(10, 0.9)), isTrue);
     });
 
-    test('only the last 5 sessions count (earlier weak ones are ignored)', () {
-      final rates = [...List.filled(4, 0.0), ...List.filled(5, 1.0)];
+    test('only the last 10 sessions count (earlier weak ones are ignored)', () {
+      final rates = [...List.filled(4, 0.0), ...List.filled(10, 1.0)];
       expect(engine.shouldRaiseTier(rates), isTrue);
     });
 
@@ -215,6 +224,17 @@ void main() {
       expect(next.bpm, MitProgression.defaultBpm);
       expect(next.backedUp, isFalse);
       expect(next.parked, isFalse);
+    });
+
+    test('the tier gate is capped at level 3 (item 12)', () {
+      // At the top level, a strong history no longer raises...
+      expect(engine.shouldRaiseTier(List.filled(10, 1.0), currentTier: 3),
+          isFalse);
+      expect(engine.shouldRaiseTier(List.filled(10, 1.0), currentTier: 2),
+          isTrue);
+      // ...and raiseTier clamps rather than running past 3.
+      expect(engine.raiseTier(st(topRung, tier: 3)).syllableTier, 3);
+      expect(engine.raiseTier(st(topRung, tier: 2)).syllableTier, 3);
     });
   });
 
@@ -268,7 +288,7 @@ void main() {
             reason: 'a Pass block must never lower the rung');
         prev = state.rung;
       }
-      // R2→R3 (co-production auto-proceed) →R4→R5: climbing, never starts at R6.
+      // Three Pass blocks: R2→R3→R4→R5 (every word rung is judged now).
       expect(state.rung, Rung.r5);
     });
   });

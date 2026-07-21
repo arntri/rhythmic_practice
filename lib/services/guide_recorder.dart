@@ -16,7 +16,17 @@ import 'audio_crypto.dart';
 class GuideRecording {
   final String encryptedPath;
   final SyllableDetection detection;
-  const GuideRecording({required this.encryptedPath, required this.detection});
+
+  /// The trimmed, denoised samples that were actually stored (the same bytes the
+  /// encrypted clip holds). Exposed so the caller can analyze the intonation
+  /// contour without re-decrypting; null if trim/decode failed.
+  final Float64List? samples;
+
+  const GuideRecording({
+    required this.encryptedPath,
+    required this.detection,
+    this.samples,
+  });
 }
 
 /// Records a phrase's guide as the caregiver says it ONCE, slowly and stretched,
@@ -77,6 +87,7 @@ class GuideRecorder {
     // are relative to what's actually saved).
     var detection = const SyllableDetection(0, []);
     Uint8List? trimmedWav;
+    Float64List? trimmedSamples;
     try {
       final samples = await WavReader.readFile(recordedPath);
       // Remove stationary background noise (estimated from the quiet lead-in),
@@ -84,6 +95,7 @@ class GuideRecorder {
       final denoised = reduceNoise(samples);
       final trimmed = trimToSpeech(denoised);
       detection = detectSyllableNuclei(trimmed);
+      trimmedSamples = trimmed; // handed back for intonation-contour analysis
       trimmedWav = WavWriter.encode(trimmed);
     } catch (e) {
       debugPrint('GuideRecorder: denoise/trim/detect failed: $e');
@@ -112,7 +124,8 @@ class GuideRecorder {
       // Trim/encode failed — fall back to storing the original clip.
       enc = await _crypto.encryptFile(File(recordedPath), encryptedPath);
     }
-    return GuideRecording(encryptedPath: enc, detection: detection);
+    return GuideRecording(
+        encryptedPath: enc, detection: detection, samples: trimmedSamples);
   }
 
   Future<void> dispose() async => _recorder.dispose();
