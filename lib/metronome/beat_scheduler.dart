@@ -75,3 +75,20 @@ class BeatScheduler {
     return (us % beatPeriodUs) / beatPeriodUs;
   }
 }
+
+/// Whether a beat is still worth *sounding* at the moment [now] that the frame
+/// carrying it actually arrived.
+///
+/// [BeatScheduler.update] deliberately fires every beat a stalled frame missed,
+/// so beat *counting* stays anchored to the absolute grid — the practice FSM's
+/// state timeouts count beats since entry and would stall with it otherwise.
+/// Replaying those missed beats **audibly**, though, is heard as a machine-gun
+/// burst of ticks: the exact opposite of a metronome. So a beat is sounded only
+/// while we are still nearer to it than to the one after it; any beat later than
+/// that has been overtaken by its successor and is dropped silently.
+bool shouldSoundBeat({
+  required Duration scheduled,
+  required Duration now,
+  required int beatPeriodUs,
+}) =>
+    (now.inMicroseconds - scheduled.inMicroseconds) * 2 < beatPeriodUs;

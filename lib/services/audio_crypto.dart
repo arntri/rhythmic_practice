@@ -70,4 +70,11 @@ class AudioCrypto {
     final data = await File(path).readAsBytes();
     return AesCipher.decrypt(data, key);
   }
+
+  /// The raw key bytes, for handing to a background isolate that has to do its
+  /// own decryption. The keystore is only reachable from the root isolate, so a
+  /// worker cannot fetch the key itself — but [AesCipher] is pure, so the whole
+  /// read-and-decrypt can move off the UI thread once the key travels with the
+  /// request. The bytes never leave the process (and never touch disk or the DB).
+  Future<Uint8List> keyBytes() async => (await _key()).bytes;
 }

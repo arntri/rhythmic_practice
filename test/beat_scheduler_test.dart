@@ -61,6 +61,56 @@ void main() {
     expect(s.phaseAt(const Duration(milliseconds: 1000)), 0.0);
   });
 
+  // The catch-up above keeps beat COUNTING right (the practice FSM counts beats
+  // since entering a state). Sounding those replayed beats is a different
+  // question: on a stalled frame they'd all fire at once and be heard as a
+  // stutter burst — the bug seen on device during the caregiver verdict.
+  group('shouldSoundBeat drops beats a stalled frame delivers too late', () {
+    const period = 1000000; // 60 BPM
+
+    bool sound(int scheduledMs, int nowMs) => shouldSoundBeat(
+          scheduled: Duration(milliseconds: scheduledMs),
+          now: Duration(milliseconds: nowMs),
+          beatPeriodUs: period,
+        );
+
+    test('a beat delivered on time is sounded', () {
+      expect(sound(1000, 1000), isTrue);
+      expect(sound(1000, 1016), isTrue); // one frame late
+    });
+
+    test('a beat still nearer to itself than to the next one is sounded', () {
+      expect(sound(1000, 1499), isTrue);
+    });
+
+    test('a beat overtaken by the next one is dropped', () {
+      expect(sound(1000, 1500), isFalse);
+      expect(sound(1000, 4200), isFalse);
+    });
+
+    test('a 3.2s stall sounds only the newest of the overdue beats', () {
+      // Exactly the burst from the device report: beats 1,2,3 all come due in
+      // the single frame at 3.2s. Only beat 3 is still current.
+      final sounded = [
+        for (final beat in [1, 2, 3])
+          if (sound(beat * 1000, 3200)) beat
+      ];
+      expect(sounded, [3]);
+    });
+
+    test('the window scales with tempo', () {
+      // At 120 BPM (500ms) the same 400ms lateness is past the halfway point.
+      expect(
+        shouldSoundBeat(
+          scheduled: const Duration(milliseconds: 1000),
+          now: const Duration(milliseconds: 1400),
+          beatPeriodUs: 500000,
+        ),
+        isFalse,
+      );
+    });
+  });
+
   test('changing BPM mid-run re-anchors without a double-beat', () {
     final s = make(60)..start();
     s.update(const Duration(milliseconds: 0)); // beat 0

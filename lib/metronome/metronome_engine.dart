@@ -33,6 +33,10 @@ class MetronomeEngine {
   final AudioPlayer _player = AudioPlayer();
   bool _soundReady = false;
 
+  // The volume currently set on the player, so [_playTick] can skip a redundant
+  // setVolume call. Matches the 1.0 applied in [_preloadSound].
+  double _appliedVolume = 1.0;
+
   // Haptic capability, probed once at startup (querying every beat is wasteful).
   // Both stay false until the async probe finishes, so the first beat or two may
   // not buzz — imperceptible in practice.
@@ -114,9 +118,23 @@ class MetronomeEngine {
   }
 
   // Called by the scheduler exactly on each beat.
+  //
+  // The scheduler replays every beat a stalled frame missed so the FSM's beat
+  // counting stays on the absolute grid — but the *cues* must not be replayed.
+  // A long UI-thread stall (the attempt-scoring work at the caregiver verdict
+  // used to be one) would otherwise dump five or six ticks into a single frame,
+  // heard as a stutter burst. [shouldSoundBeat] drops the overtaken ones so the
+  // pulse stays even: a stall costs a beat or two of silence, never a burst.
   void _handleBeat(int index, Duration scheduledTime) {
-    if (soundEnabled) _playTick();
-    if (hapticEnabled) _haptic();
+    final onTime = shouldSoundBeat(
+      scheduled: scheduledTime,
+      now: _lastElapsed,
+      beatPeriodUs: _scheduler.beatPeriodUs,
+    );
+    if (onTime) {
+      if (soundEnabled) _playTick();
+      if (hapticEnabled) _haptic();
+    }
     onBeat?.call(index);
   }
 
@@ -124,11 +142,16 @@ class MetronomeEngine {
     if (!_soundReady) return;
     // Fire-and-forget: restart the preloaded clip from the top. We intentionally
     // do NOT await here — awaiting would couple beat timing to audio latency.
-    _player
-        .seek(Duration.zero)
-        .then((_) => _player.setVolume(tickVolume.clamp(0.0, 1.0)))
-        .then((_) => _player.resume())
-        .catchError((_) {});
+    // The volume is only re-sent when it actually changes (it changes at rung
+    // seams, not per beat), so the common tick costs two platform round-trips
+    // rather than three — it adds up on a low-end phone.
+    final volume = tickVolume.clamp(0.0, 1.0);
+    Future<void> tick = _player.seek(Duration.zero);
+    if (volume != _appliedVolume) {
+      _appliedVolume = volume;
+      tick = tick.then((_) => _player.setVolume(volume));
+    }
+    tick.then((_) => _player.resume()).catchError((_) {});
   }
 
   /// Probe the vibrator once. On platforms without one (e.g. desktop) this
