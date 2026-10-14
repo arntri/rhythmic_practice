@@ -1,6 +1,6 @@
 # Rhythmic Practice — App Functionality Overview
 
-*This document describes exactly what the app does, derived from the current source code and the passing test suite (not from design intent). All thresholds, constants, and behaviors below are as written in `lib/`. Current state: **338 tests passing** (+1 skipped), `flutter analyze` clean.*
+*This document describes exactly what the app does, derived from the current source code and the passing test suite (not from design intent). All thresholds, constants, and behaviors below are as written in `lib/`. Current state: **429 tests passing** (+1 skipped), `flutter analyze` clean.*
 
 ---
 
@@ -8,46 +8,110 @@
 
 A **caregiver-assisted speech-practice app** (Flutter) for people recovering speech — built on **Melodic Intonation Therapy (MIT)**: practising words slowly, on a steady beat, with graded support that fades as the person improves. The patient practice surface is **landscape** (a propped tablet, hands-free); the caregiver setup pages are **portrait**.
 
-The person practises one word at a time; a caregiver sits alongside and, on the levels that call for it, marks how each attempt went. The app uses those caregiver judgements (not any ML model) to move each word up or down a support ladder over time.
+The person practises one word or phrase at a time; a caregiver sits alongside and marks how each attempt went. The app uses those caregiver judgements (not any ML model) to decide what happens next — within the session, and to move the person up MIT's levels over time.
 
 ### Core principles (enforced in code)
-- **MIT support ladder** — a once-per-session **warm-up** (feel the beat, then hum), then every word climbs a 5-rung ladder (R2–R6) from "say it in unison" to "say it solo"; difficulty changes one dial at a time.
+- **MIT's own structure** — a once-per-session **warm-up** (feel the beat, then hum), then **every item runs the whole step sequence for the patient's level, in one sitting**, from humming the tune to answering a question with the phrase. A failed step backs up immediately; two failures set the item aside.
+- **Both MIT ingredients run on every trial** — the melody *and* the rhythmic hand tapping. Each phrase opens with its own melody **hummed twice** before any words appear, and the caregiver is cued to tap the person's **left hand once per syllable** through the whole of every phrase — hum, model, and their own production alike. Tapping is a support, never a gate: it is recorded, but it can never move the sequence.
 - **Audio-led, reading-optional** — the spoken model is the primary cue; a picture is the default on-screen support; the written word is optional (reading is often impaired in aphasia).
 - **Caregiver-driven, rules-based progression** — the acoustic/ML scoring **never gates progression**; only the caregiver's Pass/Fail/Unsure does. The scoring is measured and displayed only.
 - **Local-first & private** — everything works fully offline; raw audio is AES-encrypted on the device and auto-deleted after 48h; only anonymous metrics ever sync, and only with explicit consent.
 - **Errorless, gentle** — slowing the tempo and adding support come before failure; "slowing down is support, not failure."
 
 ### Tech stack (`pubspec.yaml`)
-Flutter; `sqflite` (local SQLite, schema **v25**); `audioplayers` (playback); `record` (mic); `flutter_tts` (fallback voice); `fftea` (FFT); `vibration` (haptics); `encrypt` + `flutter_secure_storage` (AES-256 at rest); `image_picker` (name-card photos); `supabase_flutter` (optional cloud); `uuid`. One bundled asset: `assets/audio/tick.wav` (metronome).
+Flutter; `sqflite` (local SQLite, schema **v32**); `audioplayers` (playback); `record` (mic); `flutter_tts` (fallback voice); `fftea` (FFT); `vibration` (haptics); `encrypt` + `flutter_secure_storage` (AES-256 at rest); `image_picker` (name-card photos); `supabase_flutter` (optional cloud); `uuid`. Bundled assets: `assets/audio/tick.wav` (metronome) and the starter library's guide clips under `assets/audio/starter/`.
 
 ---
 
-## 2. The MIT support ladder (`lib/practice/progression.dart`)
+## 2. MIT's levels and steps (`lib/practice/mit_sequence.dart`)
 
-**Progression refactor (built-and-tested):** tapping and humming are a once-per-session **warm-up**, not per-word rungs. Each word's ladder runs **R2 → R6** (unison → solo). The rung decides what the screen asks, whether the model plays, whether the caregiver judges, and whether the mic records.
+**The revert to canonical MIT (2026-09-01, DB v28).** The app used to run a
+support **ladder**: a word *sat* at a rung, ran three reps there, and an engine
+moved it up or down **between sessions** — so a word could take weeks to travel
+from unison to solo. MIT does not work that way. The clinician runs **the whole
+step sequence on every item, every session**, and backs up a step the instant one
+fails. The sequence *is* the therapy; the ladder was our re-engineering of it.
 
-The `Rung` enum still holds all 8 values (R0–R7) so stored rung integers never need remapping, but membership is now three groups: **warm-up = R0/R1**, **active word ladder = R2–R6** (`activeLadder`, `entryRung = R2`, `topRung = R6`), **deferred = R7** (off by default, absent from the active flow).
+**A level belongs to the PATIENT, not to a word.** MIT's three levels are three
+step sequences chosen for the person's severity. (Our old "level" meant a
+phrase's syllable count, which confused *how long an item is* with *how much
+support the person needs*. That is gone.)
 
-| Rung | Group | Title (on screen) | What happens | Model plays? | Caregiver judges? | Mic records? |
-|---|---|---|---|---|---|---|
-| **R0** | warm-up | Feel the beat | Session warm-up: feel/tap the beat, no speech | no | no (warm-up, never judged) | no |
-| **R1** | warm-up | Hum along | Session warm-up: hum/voice to the beat, no words | no | no (warm-up, never judged) | no |
-| **R2** | word (entry) | Say it together | Intone the word **in unison** with the model | yes | **yes** | no |
-| **R3** | word | Together, model fades | Start together; the model **fades** so she carries it | yes (fades) | **yes** | no |
-| **R4** | word | Repeat after the model | Listen, then repeat | yes | yes | **yes** |
-| **R5** | word | Delayed repeat | Listen, pause, then repeat | yes | yes | **yes** |
-| **R6** | word (top) | Say it on your own | Solo production, prompt only | no | yes | **yes** |
-| **R7** | *deferred* | Answer the question | *(scaffold, OFF)* App plays a probe question; she answers solo | no | yes | **yes** |
+| Level | Sequence | For |
+|---|---|---|
+| **I** | hum melody → hum in unison → intone in unison | Most severe. Never asked to produce independently, so nothing here can be failed for not speaking. |
+| **II** | hum melody → intone in unison → unison fading → immediate repeat → **probe question** | MIT's core. The default. |
+| **III** | delayed repeat → **probe question** → **Sprechgesang** → **spoken production** | Established items: retrieval, use, then the bridge back out of song. |
 
-Membership rules in code:
-- **Warm-up (R0/R1):** the session-opening tap-then-hum; **never per-word, never judged**. If one is ever fed to the engine it auto-proceeds (a safety net), it can never Fail. Tapping accuracy can therefore **never advance a word** (the bug this refactor fixes).
-- **Judged (R2–R7):** `isJudged` — **every word rung is caregiver-judged**, including unison (R2). The ungraded co-production exposure now lives entirely in the warm-up.
-- **Recorded/scored (R4–R7):** `cleanCapture` — only solo productions are recorded and acoustically scored. (R2/R3 are judged but *not* recorded — the model is still playing, so a mic sample would be contaminated.)
-- **Active-ladder movement:** `raisedActive()` clamps at R6 (never into R7); `loweredActive()` clamps at R2 (never below unison).
+**The steps** (`MitStep`):
 
-**R7 — response-to-a-question (deferred scaffold):** kept as a future top rung but **OFF by default** and absent from `activeLadder`; the active ladder tops out at R6 (solo). The probe-question plumbing (`probe_question_text/_clip_path`, routing, tests) remains so it can be switched on later without a migration. The tier gate keys off top-rung = **R6** mastery, window **10** sessions @ 90%.
+| Step | Model plays | Judged | Mic |
+|---|---|---|---|
+| **hum melody** | yes (synthesized) | **no** — the melody is being *given* | no |
+| **hum unison** | yes | yes | no |
+| **intone unison** | yes | yes | no |
+| **unison fading** | yes, cut short | yes | no |
+| **immediate repeat** | yes | yes | **yes** |
+| **delayed repeat** | yes, then 6 s silence | yes | **yes** |
+| **probe question** | the question only | yes | **yes** |
+| **Sprechgesang** | the phrase *spoken*, rhythm intact | yes | **yes** |
+| **spoken production** | nothing at all | yes | **yes** |
 
-The four difficulty dials (only one changes per move): **support** (rung), **task demand**, **linguistic load** (syllable tier), and **tempo**.
+- **`isJudged`** — everything but the opening hum. A unison step is judged *but
+  not recorded*: the model sounding aloud would contaminate the mic.
+- **`cleanCapture`** — only the three steps that yield a solo production are
+  recorded and acoustically scored.
+- **The probe question is ON.** MIT's actual step 5 — the only step that asks the
+  person to *use* the phrase rather than reproduce it. (The old ladder's R6 "say
+  it on your own, prompt only" is **retired**: it is not a MIT step, and the
+  probe question is the independent production.)
+- **`isIntoned`** — the last two steps of Level III are deliberately not sung.
+  **Sprechgesang** keeps MIT's rhythm and the hand-tapping but drops the pitch
+  contour: the phrase is *spoken* with exaggerated prosody. **Spoken production**
+  drops even that. This is MIT's exit ramp and it is not optional — a patient who
+  can produce a phrase only while singing it has not generalised. The withdrawal
+  is staged, so there is always something left to hold onto.
+
+### The one deliberate departure — 2-of-3 reps (`RepRule`)
+
+Not MIT's; the caregiver's. A trained clinician judges a production once and is
+right; an untrained caregiver watching their parent is not so sure, and a wrong
+verdict here costs a step wrongly failed and a person wrongly backed up. So each
+judged step is produced **twice, or three times at worst**:
+
+- **Pass, Pass** → passed. No third.
+- **Fail, Fail** → failed. No third either — a third try after two clear failures
+  is the opposite of errorless practice.
+- **Anything else** (any Unsure, or one of each) → a deciding third, simple
+  majority; three Unsures fail safe.
+
+The asymmetry is deliberate: certainty in either direction stops at two, and only
+doubt costs a third rep.
+
+### Back-up and set-aside (`MitItemRun`)
+
+- **A failed step backs up to the previous step and re-runs it — immediately**,
+  in the same sitting. Support is restored in the moment, not at the word's next
+  appearance. At Level II, failing the first *judged* step backs up to **the
+  hum**: the person who cannot intone it in unison needs the melody again.
+- **Two step failures in a row** — or a failure with nowhere lower to go — **sets
+  the item aside** for today and the session moves on. Drilling a failure is not
+  what MIT does. (This replaced the old park-and-switch, which spliced in an
+  easier word.)
+
+### Level advancement (`LevelCriterion`) — the only automatic decision left
+
+**≥ 90% of judged productions across the last 10 sessions** moves the **person**
+up a level. Evaluated once, at session end. Caregiver-toggleable
+(`auto_progress_enabled`), and the level is settable by hand in the caregiver
+portal at any time.
+
+### What is gone
+
+No per-word rung. No syllable tier. **No tempo dial** — MIT intones slowly and
+stays there, so there is one caregiver-set session tempo (40–70 BPM, a comfort
+setting) and nothing lowers it on failure. No comfort cap. `progression.dart` and
+`mit_progression.dart` are deleted; see `DEPRECATIONS.md` §2–§4.
 
 ---
 
@@ -56,63 +120,54 @@ The four difficulty dials (only one changes per move): **support** (rung), **tas
 Driven by a deterministic state machine (`lib/practice/practice_controller.dart`) clocked by the metronome; rendered by `lib/screens/practice_view.dart`; assembled by `lib/screens/practice_screen.dart`.
 
 **Session assembly** (`practice_screen._setUp`):
-1. Load the profile + the **active** phrases (up to `session_phrase_limit`, default 10; the default seed has **15 phrases, 5 active** single-syllable words; two seeded longer phrases give L2/L3 examples out of the box).
-2. Load each word's progression record (rung from the phrase row; tier + tempo from `progression_state`).
-3. Decrypt any name-card photos for display.
-4. Build the session as **each word repeated 3× consecutively** (the fixed 3-rep block, `MitProgression.repsPerBlock = 3`).
-5. **Ambient calibration:** record ~2 s of room noise to set the per-session speech threshold, then a 350 ms settle so the audio session is back in playback mode.
-6. Start the metronome + controller.
+1. Load the profile — including the **patient's MIT level**, which selects the sequence every item will run — and the **active** phrases (up to `session_phrase_limit`, default 10).
+2. Decrypt any name-card photos for display.
+3. Build the session as **one entry per item** (reps are no longer baked into the list — how many productions a step takes is decided step by step by `RepRule`).
+4. **Ambient calibration:** record ~2 s of room noise to set the per-session speech threshold, then a 350 ms settle so the audio session is back in playback mode.
+5. Start the metronome + controller.
 
-**States** (`PracticeState`): `preparation → warmUpHum → referencePrompt → (inputCapture) → systemTransition → … → sessionComplete`.
+**States** (`PracticeState`): `preparation → warmUpHum → phraseHum → referencePrompt → (inputCapture) → systemTransition → … → sessionComplete`. The controller translates the current **MIT step** into these states; a verdict feeds the step's `MitItemRun`, and whatever step the run lands on next is re-entered — which is why *another rep*, *the next step* and *an immediate back-up* are all one code path.
 
-- **Warm-up — once per session** (fits "lock once, then flow"):
-  - **Preparation ("Feel the beat").** Feel/tap the beat: **3 in-time taps** (within ±0.25 of the beat) lock it in. Tapping only ends the warm-up — it can **never advance a word**.
-  - **Warm-up hum ("Hum along").** After the lock, `warmUpHum` runs for `warmUpBeats` (default 8) — hum/voice to the beat — then flows into the first word. (A zero-length warm-up, `warmUpBeats <= 0`, skips straight to the first word; used in unit tests.)
-  - Both warm-up phases render the element-free arena (pulse ring, no word), keyed on **state**, not on a per-word rung.
-- **Reference prompt** — shaped by the word's rung (R2–R6):
-  - R2/R3: a 5-second "Get ready" countdown, then the model plays (R3 fades out); cue "Say it together" / "Carry it as it fades".
-  - R4/R5: cue "Listen…", the model plays.
-  - R6: "Get ready…" prompt (~2.5 s), then the mic opens.
-  - *(R7, deferred/off: would play a probe question then open the mic — routing exists but is not in the active flow.)*
-- **Input capture (R4–R6)** — the mic opens, the background turns a **distinct green** and a "Recording — say it once" pill shows. It auto-closes after a window of silence (caregiver-set 3–8 s, default 4.5 s).
-- **Verdict (R2–R6)** — a full-height **caregiver bar pinned to the right edge** (so the left stays free for the user): **Accept** (green, =Pass), **Unsure** (blue), **Not yet** (yellow, =Fail). The warm-up has no verdict.
+- **Warm-up — once per session** (fits "lock once, then flow"). Not a MIT step:
+  - **Preparation ("Feel the beat").** Feel/tap the beat: **3 in-time taps** (within ±0.25 of the beat) lock it in. Tapping only ends the warm-up — it can **never move the sequence**.
+  - **Warm-up hum ("Hum along").** After the lock, `warmUpHum` runs for `warmUpBeats` (default 8) — hum/voice to the beat — then flows into the first item.
+  - Both render the element-free arena (pulse ring, no word), keyed on **state**.
+- **Hum step** (`phraseHum`, MIT step 1). The item's **own melody is hummed twice** while **the item itself stays on screen** (the picture, or the word when there is no picture). What this step withholds is the **spoken model** — the app hums rather than says the words — not the item's identity: the person is meant to hold the phrase in mind against the tune, which they cannot do if they don't yet know which phrase it is. Two pitches a minor third apart, one syllable per beat, synthesized on the spot from the phrase's syllable count + stressed syllable (`lib/practice/hum_melody.dart`, played by `lib/services/melody_hummer.dart`). The melody contour is enlarged here — the tune is the content, not a reinforcement. Nothing is recorded and **nothing is judged**. The screen ends the state when the melody finishes; `phraseHumBeats` (default 12) is only a safety cap, and `0` disables the step (used by unit tests).
+- **Reference prompt** — shaped by the current **step**:
+  - **hum unison:** the melody plays again and she hums with it; then the verdict. Level I only.
+  - **intone unison / unison fading:** a 5-second "Get ready" countdown, then the model (the fading step drops the final syllable so she carries the end alone); cue "Say it together" / "Carry it as it fades".
+  - **immediate repeat:** cue "Listen…", the model plays, a 1.2 s breath, then the mic.
+  - **delayed repeat:** the model, then **six seconds of silence** before the mic (`delayedRepeatMs`, `lib/practice/step_timing.dart`) — the delay is the point: a short gap lets the phrase be echoed while it still rings, a long one forces genuine retrieval. The beat keeps running and the caregiver keeps tapping through it.
+  - **probe question:** the caregiver's recorded/typed question plays (a gentle generic prompt if none is set — it never blocks), a breath, then the mic.
+  - **Sprechgesang:** the phrase's slow-**spoken** clip plays, deliberately *not* beat-warped onto the melody — the pulse is carried by the metronome and the tapping hand instead, which is the whole content of the step. The tick stays audible until the model ends. Then a breath, then the mic. Falls back to the built-in voice when no slow-spoken clip has been authored.
+  - **spoken production:** nothing plays. A brief get-ready (2.5 s), then the mic.
+- **Input capture** — at the three recording steps, the mic opens, the background turns a **distinct green** and a "Recording — say it once" pill shows. Auto-closes after a window of silence (caregiver-set 3–8 s, default 4.5 s).
+- **Verdict** — a full-height **caregiver bar pinned to the right edge** (so the left stays free for the user): **Yes** (pale green, =Pass), **Maybe** (pale lavender, =Unsure), **Not yet** (pale amber, =Fail). The question is per step ("Did they carry it as the model faded?", "Did they answer with the word?"). The warm-up and the hum step have no verdict.
 
-**On-screen indicators:** top-left pill = **"Word X of Y"** (counts words, not reps); bottom-left chip = the **current stage** ("R2 · Say it together" + a **5-dot** ladder for R2–R6, current rung filled).
+**Hand tapping (on screen):** through the hum, the model and the person's own production, a tap cue sits along the bottom — a dot that swells on the beat (so the caregiver has something to tap in time with even when the tick is off) beside *"Tap their left hand on each syllable"*. Every tap that lands lights it. It shows **no accuracy**: an off-beat tap looks exactly like an on-beat one. It is hidden in the gaps — the count-in, the six-second retrieval silence, the verdict.
+
+**On-screen indicators:** top-left pill = **"Word X of Y"** (one item per entry now); bottom-left chip = the **current step** ("Step 4 · Repeat after the model") with one dot per step of the level's sequence, current filled — a position in this item's run, not a rung the word has been assigned to.
 
 ---
 
-## 4. The progression engine (`lib/practice/mit_progression.dart`)
+## 4. Tapping, and what it does not do
 
-Rules-based, label-driven, on two timescales. **The ML model never gates this.**
+Canonical MIT taps the patient's **left hand once per syllable through every
+production at every step** — it is one of the therapy's two active ingredients,
+not a readiness drill. So tapping is cued for the whole of every production
+(`PracticeController.tappingExpected`, opened and closed by the screen via
+`beginProduction`/`endProduction`), including the unison steps where nothing is
+recorded.
 
-### Fast loop — the 3-rep block (`evaluateBlock`)
-A word is always practised **exactly 3 reps** at its current rung; the decision is made **only after the block** (never mid-block). **Every word rung (R2–R6) is judged:**
-- **≥ 2 Passes →** advance one rung (`raisedActive`, clamps at R6; reset tempo, clear "backed-up").
-- **≥ 2 Fails →** first **lower the tempo** one step (60→50→40 BPM); at the floor, **back up one rung** (`loweredActive`, clamps at the R2 unison floor); a failed block at the already-backed-up rung **parks** the word for the session.
-- **Otherwise (e.g. mostly Unsure) →** hold. **Passes never demote**; a failed block never forces an advance.
-- **Caregiver cap:** advancement is clamped to a caregiver-set ceiling (low-energy sessions).
+It is **completely non-gating**. Tap accuracy is logged for analytics only; the
+once-per-session tap/hum warm-up is never judged; and nothing about the taps
+moves the sequence — only the caregiver's verdict does. A user with hand weakness
+must never be blocked, and the caregiver may tap hand-over-hand on their behalf.
 
-*(The warm-up rungs R0/R1 are not part of any word's block; if ever fed to `evaluateBlock` they auto-proceed as a safety net and can't Fail.)*
-
-A rung change takes effect **the next time the word appears** (announced by a SnackBar that names the word, e.g. *"'Help': moved up to R4 · Repeat after the model"*).
-
-### Levels by syllable count (entry rung is always unison)
-A phrase's **level** is derived from its confirmed **syllable count** (`levelForSyllableCount`): **L1 = 1–3 syllables, L2 = 4–6, L3 = 7+**, capped at 3. Level seeds the word's **starting linguistic-load tier** (a longer phrase opens at a higher tier). **Every word now enters at unison (R2)** regardless of level (`entryRungForLevel` → R2) — the progression refactor's "each word's ladder starts at unison" supersedes the old level→entry-rung skip. **Level 3 still requires a caregiver-recorded slow-spoken *Sprechgesang* clip** (scaffold: `sprechgesang_clip_path` + `sprechgesangSatisfied`); until one exists, the tier gate won't raise a word into L3. The recording UI for it is not built yet.
-
-### Slow loop — syllable tier (`shouldRaiseTier` / `raiseTier`)
-Across sessions: when a word's pass rate is **≥ 90% over the last 10 sessions** (`tierPassRate = 0.9`, `tierWindow = 10`) **and it isn't already at the top level (`maxLevel = 3`)**, raise its syllable tier **and reset its rung to unison (R2)** — never raise linguistic load and drop support in the same move. (This gate-reset to unison is distinct from the *entry* rung above: the gate always restores full support after a load increase.)
-
-### Park-and-switch, never end on failure (audit item 14)
-When a word **parks** after repeated failure, the session doesn't press on with the fixed list — it **splices in a word she can currently succeed at** (the lowest-rung active word) so the next thing is a win (capped so a run of parks can't grow the session without bound). And the session **never ends on a failed verdict**: if the last word's attempt fails, a gentle low-rung **closer** is appended so the final thing she does is a light win.
-
-### The warm-up never traps anyone on tap performance
-The tap/hum warm-up runs **once per session** and is **never judged**: tap accuracy is **logged for analytics only and never gates progress** (a user with hand weakness must never be blocked). Because tapping/humming are no longer per-word rungs, tap performance can never advance — or hold back — a word.
-
-### Per-word tempo is live, and tempo drops are announced as help
-The per-word tempo **is applied to the live metronome**, re-anchored only at the **word boundary** (the start of a word's block, never mid-prompt — the controller counts beats since state entry, so a tempo change can't trip a timeout). A word's tempo is capped at the caregiver's base tempo and lowered toward the 40 BPM floor on failure; advancing restores it. When the beat slows as support (e.g. 60→50), a **calm, non-punitive cue** is shown — *"Slowing the beat for 'Help' to make it easier"* — never framed as failure.
-
-> **Constants:** `repsPerBlock = 3`, `defaultBpm = 60`, tempo range `40–70`, `tempoStep = 10`, `tierPassRate = 0.9`, `tierWindow = 10`.
-> **Single source of truth:** the rung lives in one place (`_progState`, mirrored to the phrase row for the settings view); the on-screen stage, the behavior, and the announcement all read the same value.
+**Phrase-locked, not clock-locked.** The tapping starts and stops **with the
+phrase**, so a three-syllable phrase gets three taps and then the hand rests. Any
+state change closes the window, so it can never leak past the production that
+opened it.
 
 ---
 
@@ -125,7 +180,7 @@ The per-word tempo **is applied to the live metronome**, re-anchored only at the
 - Tempo bounded **40–70 BPM** in practice (one beat ≈ one syllable; slow is support).
 
 ### Guide playback (`lib/services/guide_player.dart`)
-- **Recorded guide (preferred):** decrypt → decode → **pitch-preserving time-stretch (WSOLA, `lib/practice/time_stretch.dart`)** → play (the recording stays untouched; only the playback copy is stretched). **Voice-to-beat alignment (`beat_align.dart`):** when the guide's syllable timings are known, the stretch is chosen so the **average syllable spacing equals one beat** at the word's tempo — so the voice and the metronome don't drift apart (interim of a full per-syllable warp). Otherwise it falls back to per-rung elongation (unison 2.8×, repeat 2.2×, solo 1.8×). R3 **fades** the volume (1.0 → ~0.15) so the user carries the word.
+- **Recorded guide (preferred):** decrypt → decode → **pitch-preserving time-stretch (WSOLA, `lib/practice/time_stretch.dart`)** → play (the recording stays untouched; only the playback copy is stretched). **Voice-to-beat alignment (`beat_align.dart`):** when the guide's syllable timings are known, the stretch is chosen so the **average syllable spacing equals one beat** at the word's tempo — so the voice and the metronome don't drift apart (interim of a full per-syllable warp). Otherwise it falls back to per-step elongation (unison 2.8×, repeat 2.2×, probe 1.8×). The **unison-fading** step drops the final syllable and fades the volume (1.0 → ~0.15) so the user carries the end alone.
 - **TTS fallback** (no recorded clip): `flutter_tts` at a rate of `0.30 / ttsStretch` (slower than the recorded path; clamped 0.1–0.35).
 - **Caregiver "Playback speed" (1× / 0.75× / 0.5×):** an overall multiplier that divides into the stretch — 0.5× makes the word come out at half speed.
 - Completion fires once, via the player event **or** a duration-sized safety timer.
@@ -134,26 +189,28 @@ The per-word tempo **is applied to the live metronome**, re-anchored only at the
 - Records 16 kHz mono PCM16 WAV; closes after silence (caregiver-set window) using a speech threshold derived from the per-session ambient calibration (median ambient + 12 dB, clamped −55…−25 dBFS; default −40 dBFS).
 - Measures **latency** (gap to first speech) and **duration**; encrypts the clip at rest.
 
-### Guide recording flow (`lib/services/guide_recorder.dart`, `guide_recording_screen.dart`)
-Caregiver records each word **once, slowly, in a sung/intoned voice, no metronome**: **learn the tune from two demos** (see below) → **"Now you"** record → **noise reduction** (spectral subtraction) → **silence trim** → **syllable-nucleus detection** (RMS envelope + voicing gate + min-separation) → caregiver **reviews/adjusts** the syllable count (merge/split) → **taps which syllable is the HIGH note** (one human tap = the source of truth for "correct stress") → the machine **checks the melody** and coaches one fix at a time (see below) → **confirm + encrypt + save**. The recorded clip doubles as the acoustic reference. One scrolling screen, big controls, minimal text — imitation over instruction.
+### Guide clips are authored, not recorded in-app
+**Caregivers never record.** The owner authors every guide clip and ships it with the app; the in-app caregiver recording flow (`guide_recording_screen.dart`, `guide_recorder.dart`) has been **removed**. Each phrase needs **two** authored clips — the sung guide (`guide_clip_path`, which doubles as the DTW acoustic reference) and the slow-spoken Sprechgesang clip (`sprechgesang_clip_path`) the last steps of Level III play. With either missing the app falls back to the built-in voice: it runs, but it is not the therapy.
 
-### Intonation flow — the melody the patient copies (`lib/analysis/pitch_detection.dart`, `lib/practice/intonation_contour.dart`, `lib/practice/intonation_reference.dart`)
-The guide must carry a clear, correct **high–low contour**, so the caregiver PRODUCES + APPROVES while the machine DETECTS + CHECKS (neither fully automated nor dependent on the caregiver's musical skill):
-- **Teach by two demos, no jargon** (`_teachMelody`, item 5): before recording, two contrasting tappable examples play — **"WA-ter"** (high→low, strong part first) and **"a-GAIN"** (low→high, strong part second), each a synthesized two-tone with a matching raised/lowered dot. They teach *the strong part goes up* without musical terms; then **"Now you"** invites the recording.
-- **Detect** (`estimatePitch` autocorrelation F0 + RMS energy + duration, each judged **relative to neighbouring syllables**; weighted 60% pitch / 25% energy / 15% duration): the highest-scoring voiced syllable is the produced "high note"; total movement is measured in semitones.
-- **"Good enough" acceptance** (`checkContour`): we do **not** require a precise minor third — any *clear* movement (≥ 1.5 semitones) on the caregiver-designated syllable passes. Only two things fail: **flat** (too even) or **mis-stressed** (high note on the wrong syllable). A single-syllable word passes if voiced.
-- **Targeted feedback, one fix at a time** — flat → *"lift your voice more on part N, like the example"*; mis-stressed → *"the high note landed on part X; try it on part N instead"*, each with a replayable phrase-shaped example.
-- **Graceful fallback** — after ~2 flat/mis-stressed takes the caregiver is never trapped: they can save the natural recording as-is, and the **on-screen melody cue** still carries the target contour (never flat-and-unnoticed). No pitch re-synthesis of the caregiver's voice.
-- **On-screen melody cue** (`practice_view._melodyCue`, item 9): while the word is presented, a small row of dots — one per syllable, the high-note syllable raised — reinforces the intonation visually alongside the rhythm.
+**Clip QA** (`clip_qa_screen.dart`, internal, behind demo mode): reports which authored clips exist and which phrases carry the metadata the melody is built from (syllable count, stress index). It deliberately does **not** show acoustic green ticks it hasn't earned — tempo, the minor third, one-syllable-per-beat and stress placement are **not** machine-checked.
+
+**Retained but currently uncalled:** `lib/analysis/pitch_detection.dart`, `lib/practice/intonation_contour.dart`, `lib/practice/noise_reduction.dart` and `lib/practice/audio_trim.dart` were the recording flow's DSP (F0 detection, contour check, spectral subtraction, silence trim). They are pure, unit-tested functions with **no production caller** now that the flow is gone — kept for owner-side authoring rather than deleted. `intonation_reference.dart` is still live: `hum_melody.dart` builds the synthesized melody from it.
+
+### Intonation — the melody the patient copies (`lib/practice/intonation_reference.dart`, `lib/practice/hum_melody.dart`)
+The melody the patient hears is **synthesized on the spot**, not extracted from a recording: two pitches a minor third apart, one syllable per beat, built from the phrase's syllable count and its caregiver/author-designated high-note syllable (`stress_index`, v22). So a phrase carries a correct contour whether or not an authored clip exists.
+
+- **On-screen melody cue** (`practice_view._phraseStaff`, item 9): while the word is presented, one node per syllable with the high-note syllable **raised** — the vertical axis is pitch, the horizontal is the rhythm (one syllable per beat, exactly what the hand taps). A phrase with no designated tune yet degrades to the **flat** form (every node on one line) rather than vanishing: the rhythm is true even when the melody isn't.
+- **Per-beat illumination:** the node for the syllable sounding **right now** glows as the beat reaches it. It is anchored to `PracticeController.beatsIntoProduction` — the production window opens on the model's *real* start (after the beat-sync wait), so beat 0 of the count really is the first syllable. Never lit during the "Get ready" count-in (nothing is sounding yet) and never while the mic is open (the staff is hidden there — it would become a thing to chase).
+- **Withdrawal is staged:** the staff collapses to one line at **Sprechgesang** and is **absent** at **spoken production**. The scaffold coming away is the content of those two steps, and the staff is where it can be seen coming away.
 
 ### Starter word library (`lib/data/starter_library.dart`, `lib/services/starter_installer.dart`, Part 3)
-A small set of **~10 ready-to-use phrases that ship with a bundled guide**, so a caregiver can start a first session without recording anything. They are ordinary phrases marked `is_starter = 1` (v27) — **the flag is the only structural difference and never branches practice logic** (rungs, judging, and every progression decision ignore it); it is presentation-only (eviction-safety note below + session deprioritization). Seeded **idempotently** on first launch and on the v27 upgrade (`_seedStarters`, guarded on the flag so it never double-inserts). On launch, `StarterGuideInstaller` reads each bundled clip, **encrypts it into the same `guide_clip_path` store a recorded guide uses**, and points the phrase at it — so a starter word plays and scores through the identical path (no `is_starter` branch anywhere in practice). Guide clips live in `practice_phrases.guide_clip_path`, which the **48h eviction never touches** (it only forgets patient *attempt* audio), so starter guides are permanent by design. Caregivers **add their own phrases** (any language/script) and can **hide** a starter (`is_active = 0`) or let it sit **deprioritized** behind their own words (`getActivePhrases` orders `is_starter ASC`). Nothing assumes English. **Status: built + unit-tested (manifest, seeding/idempotence, migration, eviction-safety, deprioritize, no-branch guarantee); the bundled `.wav` clips + their metadata are clearly-marked PLACEHOLDERS (`assets/audio/starter/`) — the encrypt-and-install step is a scaffold, not device-tested. The user supplies real recordings/metadata.**
+A small set of **~10 ready-to-use phrases that ship with a bundled guide**, so a caregiver can start a first session with no setup at all. They are ordinary phrases marked `is_starter = 1` (v27) — **the flag is the only structural difference and never branches practice logic** (the step sequence, judging, and level advancement all ignore it); it is presentation-only (eviction-safety note below + session deprioritization). Seeded **idempotently** on first launch and on the v27 upgrade (`_seedStarters`, guarded on the flag so it never double-inserts). On launch, `StarterGuideInstaller` reads each bundled clip, **encrypts it into the same `guide_clip_path` store every authored guide uses**, and points the phrase at it — so a starter word plays and scores through the identical path (no `is_starter` branch anywhere in practice). Guide clips live in `practice_phrases.guide_clip_path`, which the **48h eviction never touches** (it only forgets patient *attempt* audio), so starter guides are permanent by design. Caregivers **add their own phrases** (any language/script) and can **hide** a starter (`is_active = 0`) or let it sit **deprioritized** behind their own words (`getActivePhrases` orders `is_starter ASC`). Nothing assumes English. **Status: built + unit-tested (manifest, seeding/idempotence, migration, eviction-safety, deprioritize, no-branch guarantee); the bundled `.wav` clips + their metadata are clearly-marked PLACEHOLDERS (`assets/audio/starter/`) — the encrypt-and-install step is a scaffold, not device-tested. The user supplies real recordings/metadata.**
 
 ---
 
 ## 6. Speech analysis & scoring (`lib/analysis/`, `lib/services/attempt_scoring.dart`)
 
-Pure-Dart, device-independent pipeline that **measures** a solo attempt (R4–R6) against the recorded guide:
+Pure-Dart, device-independent pipeline that **measures** a solo production (the three clean-capture steps) against the recorded guide:
 - **Junk gate:** rejects clips that are too long (>10 s), too quiet (RMS < 0.01), or too short (<300 ms voiced).
 - **MFCC:** 16 kHz mono → pre-emphasis → 25 ms/10 ms Hamming frames → 512-FFT → 26 mel filters → log → DCT-II → **13 coefficients**.
 - **DTW:** Euclidean dynamic time warping; similarity = `1 / (1 + normalizedCost)` (1.0 identical).
@@ -174,7 +231,7 @@ The whole heavy path — **reading the clips, AES-decrypting them, decoding the 
 
 ## 8. Progress analytics & history (display-only)
 
-- **Trends (`lib/analytics/trend.dart`, `progress_analytics.dart`):** per-word and overall trends for **pass rate**, **sound match (similarity)**, and **response time (latency)** — smoothed moving average + relative early-vs-late comparison (10% threshold) → **improving / plateau / declining / not-enough-data**. Latency is "lower is better." Counts only judged rungs (R4–R6). Simple statistics, **not ML**, and **never** feeds progression.
+- **Trends (`lib/analytics/trend.dart`, `progress_analytics.dart`):** per-word and overall trends for **pass rate**, **sound match (similarity)**, and **response time (latency)** — smoothed moving average + relative early-vs-late comparison (10% threshold) → **improving / plateau / declining / not-enough-data**. Latency is "lower is better." Counts only the recorded steps. Simple statistics, **not ML**, and **never** feeds progression.
 - **History screen:** "Trends over time" chips, a **by-day** rollup, **by-phrase** stats (pass %, P/F/U, avg tap-sync), and recent sessions.
 - **Daily summary** (`daily_summary` table): a per-day rollup (attempts, P/F/U, avg similarity) for the dashboard and cloud sync. The per-attempt recompute is backed by indexes on `exercise_attempts(session_id)`, `exercise_attempts(timestamp)`, and `practice_sessions(profile_id)` and a sargable one-day timestamp range, so it stays a pair of index lookups rather than a full scan as history grows (audit item 22).
 
@@ -182,12 +239,12 @@ The whole heavy path — **reading the clips, AES-decrypting them, decoding the 
 
 ## 9. ML scaffolding (`lib/ml/`, audit items 17–20) — *scaffold-only, never gates*
 
-Built and unit-tested, but deliberately **not trained and not in the loop**: none of this changes a phrase's rung, and the caregiver still decides every verdict. It exists so the pipeline (logging → features → model → gate → dashboard) is real end-to-end.
+Built and unit-tested, but deliberately **not trained and not in the loop**: none of this changes what the sequence does or what level the patient is on, and the caregiver still decides every verdict. It exists so the pipeline (logging → features → model → gate → dashboard) is real end-to-end.
 
 - **Fatigue detector (`fatigue_detector.dart`, item 17) — runs for real.** Unsupervised: compares a session's **late** window to its **early** window across three timing-regularity channels — inter-tap-interval variability, tap **dwell** variability, and **onset-vs-onset** vocal steadiness — and reports a 0–1 fatigue score with per-channel drift and a low-confidence flag. Rising scatter over the session reads as tiring; erratic-throughout does not (only drift counts). It deliberately **avoids** touch-area / `getSize()` (device-dependent, unreliable one-handed). Advisory only.
-- **Layer C classifier (`layer_c_classifier.dart` + `graduation_gate.dart`, item 18) — build, don't run.** The scaffold for a future learned verdict model: a feature vector assembled from already-logged data (acoustic scores + motor-timing summaries + rung/tier/tempo), a prediction interface, and a shipped **`UntrainedLayerC` that always abstains**. It may only ever be trusted once it clears the **graduation gate**: a **Wilson score lower bound on precision ≥ 0.90** over held-out caregiver labels (precision, because the danger is a false "correct"). Since nothing is trained, it abstains → no scored Pass calls → the gate never graduates → the caregiver stays in charge, by construction.
-- **Scoped solo mode (`solo_mode.dart`, item 19) — scaffold + flag.** A pure policy: a word is solo-eligible only when it's at a solo rung (≥ R6) with a strong recent top-rung pass rate over enough sessions; and even then solo mode is **advisory-only** until Layer C graduates. Wired to a `solo_mode_enabled` profile flag (off by default; caregiver toggle under Settings → *Experimental*). No dedicated solo screen yet.
-- **Insights dashboard (`insights_dashboard.dart`, `screens/ml_insights_screen.dart`, item 20).** A caregiver-facing, display-only assembly of the above — per-session fatigue, the recent pass-rate trend, Layer C's "not trusted yet, and why," and the solo-ready word count — behind an **Insights (experimental)** button in History, with a banner stating it never changes levels.
+- **Layer C classifier (`layer_c_classifier.dart` + `graduation_gate.dart`, item 18) — build, don't run.** The scaffold for a future learned verdict model: a feature vector assembled from already-logged data (acoustic scores + motor-timing summaries + the MIT step/level/tempo context), a prediction interface, and a shipped **`UntrainedLayerC` that always abstains**. It may only ever be trusted once it clears the **graduation gate**: a **Wilson score lower bound on precision ≥ 0.90** over held-out caregiver labels (precision, because the danger is a false "correct"). Since nothing is trained, it abstains → no scored Pass calls → the gate never graduates → the caregiver stays in charge, by construction.
+- **Scoped solo mode (`solo_mode.dart`, item 19) — scaffold + flag.** A pure policy: a word is solo-eligible only when its recent pass rate **at the probe question** — MIT's most independent step — is strong over enough sessions; and even then solo mode is **advisory-only** until Layer C graduates. (This was keyed on "rung ≥ R6" before the revert; with the sequence run in full every session there is no resting rung to compare, so the honest question is how the person does at the hardest step when they get there.) Wired to a `solo_mode_enabled` profile flag (off by default; caregiver toggle under Settings → *Experimental*). No dedicated solo screen yet.
+- **Insights dashboard (`insights_dashboard.dart`, `screens/insights_screen.dart`, item 20).** A caregiver-facing, display-only assembly of the above — per-session fatigue, the recent pass-rate trend, Layer C's "not trusted yet, and why," and the solo-ready word count — reachable as **Insights (experimental)** from the caregiver panel (and from History), with a banner stating it never changes levels.
 
 ---
 
@@ -199,49 +256,70 @@ Built and unit-tested, but deliberately **not trained and not in the loop**: non
 
 ---
 
-## 11. Cloud & family sharing (`cloud.dart`, `auth_service.dart`, `cloud_sharing.dart`)
+## 11. Cloud (`cloud.dart`, `sync_service.dart`) — plumbing only, no surface
 
-- Email/password accounts via Supabase; being signed out is normal (cloud just unlocks sync + remote viewing). If unconfigured, the app is fully local.
-- **Family sharing:** owners get a **share code**; family members **join with a code** to view (read-only, row-level-security filtered) the latest **metrics** (phrase, verdict, sync score, time) — no audio.
+The Supabase connection and the one-way metrics push are intact and still run on launch (`Cloud.initialize()`, `SyncService().pushPending()`), and if the cloud is unconfigured or unreachable the app is fully local — unchanged.
+
+**But there is no cloud UI any more.** The sign-in screen (`account_screen.dart`) and the family-sharing reader (`progress_screen.dart`, share codes + join-with-code), along with `auth_service.dart` and `cloud_sharing.dart`, were **removed** — they had been left unreachable by the home-screen rewrite and were cut rather than rewired. The consequence, stated plainly: `SyncService` gates on being signed in, and **nothing in the app can sign in**, so the push is dormant in practice. The caregiver's consent switch (`guardianConsentGranted`, in **Privacy**) still records intent and still gates the push, so re-adding a sign-in entry point is all that would be needed to make it live again.
 
 ---
 
 ## 12. Screens & per-screen orientation (Part 2, item 4)
 
-**Patient surface = landscape; caregiver pages = portrait** (`lib/app/orientation.dart`). The app starts landscape (`HomeScreen`, the patient's start surface, and `PracticeScreen`, the propped-tablet session). Caregiver setup pages flip to **portrait** (a phone held upright): `SettingsPortal`, `GuideRecordingScreen`, `HelpScreen`, `HistoryScreen`/`MlInsightsScreen`, `ProgressScreen`, `MetronomeScreen`, `AccountScreen`. Orientation is driven centrally by `OrientationRouteObserver` off the top route: caregiver pages push as a `PortraitPageRoute`, the practice surface as a `LandscapePageRoute`, and an untagged nested push inherits its parent's orientation — so caregiver→caregiver navigation never races on dispose. *(Built + unit-tested via the route→orientation classification and the observer's channel calls; the actual on-device rotation/layout is **built-not-device-tested** — no Linux GUI here.)*
+**Patient surface = landscape; caregiver pages = portrait** (`lib/app/orientation.dart`). The app starts landscape: `HomeScreen` (the patient's start surface) and `PracticeScreen`/`LevelUpScreen` (the propped-tablet session). Everything caregiver-facing flips to **portrait** (a phone held upright). Orientation is driven centrally by `OrientationRouteObserver` off the top route: caregiver pages push as a `PortraitPageRoute`, the practice surface as a `LandscapePageRoute`, and an untagged nested push inherits its parent's orientation — so caregiver→caregiver navigation never races on dispose. *(Built + unit-tested via the route→orientation classification and the observer's channel calls; the actual on-device rotation/layout is **built-not-device-tested** — no Linux GUI here.)*
 
-`HomeScreen` (calm lavender canvas, big "Tap to start," ⓘ help, top-right menu) → `PracticeScreen`/`PracticeView` (the session) · `HelpScreen` (first-run onboarding + reopenable) · `SettingsPortal` (caregiver, behind a **slide-to-unlock**) · `GuideRecordingScreen` · `HistoryScreen` (→ **`MlInsightsScreen`**, experimental) · `ProgressScreen` (family) · `MetronomeScreen` (standalone) · `AccountScreen`.
+**The patient's side — two screens, no menu.** `HomeScreen` is a calm canvas whose **whole surface is the button**: tapping it waters the **plant** (`widgets/plant.dart`, one growth stage per day practice happens, cumulative, never backwards) and then opens the session. The only other control is a **slide-to-unlock vine** (`widgets/vine_slide_control.dart`) to the caregiver panel — deliberately not a tappable menu. → `PracticeScreen`/`PracticeView` (the session) · `LevelUpScreen` (the level-up offer, accept/decline) · `FirstRunScreen` (first launch only, until `onboarding_seen`).
 
-**Caregiver settings expose:** tempo (40–70 BPM), sensory channels (visual/sound/haptic), session length (1–20), recording length (3–8 s), target display (picture/word/both), **playback speed (1×/0.75×/0.5×)**, auto-progression on/off, **solo practice on/off (experimental, item 19)**, add custom phrase (any language), and per-phrase: active toggle (hide/show, incl. **starter words**), **manual rung ◀/▶**, photo add/change/remove, record-guide; plus the **privacy/consent** toggle.
+**The caregiver's side — one panel with sections, not ten screens.** `CaregiverPanel` is the single landing screen, reached by the slide-to-unlock from home **or mid-session** (where arriving pauses the session on the spot — the rotation into portrait is the privacy boundary). Rows carry their current value *in the row*, so the usual question is answered without opening anything:
+
+| Section | Rows → screen |
+|---|---|
+| **OFTEN** | Practice level → `PracticeLevelScreen` · *Take a rest* (mid-session; no screen) · *Right now* → `InSessionStatusScreen` (mid-session) · Phrases → `PhraseLibraryScreen` → `AddPhraseScreen` |
+| **THE SESSION** | Session and sensory → `SessionSensoryScreen` · Practice dose → `PracticeDoseScreen` · Progress → `ProgressSummaryScreen` · History → `HistoryScreen` → `InsightsScreen` |
+| **SET ONCE** | Hand-tapping tutorial → `TappingTutorialScreen` · Help → `HelpScreen` → `TappingTutorialScreen` · Privacy and sharing → `PrivacyScreen` · Insights → `InsightsScreen` (experimental) |
+| **INTERNAL — NOT SHIPPED** *(only when `demo_mode_enabled`)* | Clip QA → `ClipQaScreen` · Library manifest → `LibraryManifestScreen` |
+
+**Caregiver controls expose:** tempo (40–70 BPM), sensory channels (visual/sound/haptic), session length (1–20), recording length (3–8 s), target display (picture/word/both), **playback speed (1×/0.75×/0.5×)**, **the patient's MIT level (I/II/III)** and automatic level advancement on/off, **solo practice on/off (experimental, item 19)**, practice-dose target (minutes a day), add custom phrase (any language), and per-phrase: active toggle (hide/show, incl. **starter words**), probe question, photo add/change/remove; plus the **privacy/consent** toggle. *(The per-phrase rung ◀/▶ control and the comfort cap are gone — there is no per-word level to set. The in-app guide recorder is gone too — clips are authored and shipped.)*
 
 ---
 
-## 13. Data model (SQLite, schema v25)
+## 13. Data model (SQLite, schema v32)
 
-- **user_profiles** — one local profile; all preferences (tempo, channels, session/recording length, consent + timestamp, target_display, playback_speed, auto_progress_enabled, onboarding_seen, session_rung_cap, demo_mode_enabled, **solo_mode_enabled** (item 19, scaffold), cloud_profile_id).
-- **practice_phrases** — text, word/syllable counts, **complexity_level (derived from syllable_count, v23)**, current_rung, guide_clip_path (encrypted reference) + guide_nuclei_ms, photo_path, **probe_question_text/_clip_path** (R7, v21), **stress_index** (high-note syllable for the melody, v22), **sprechgesang_clip_path** (item 15, v25), is_active, **is_starter** (starter word library, v27; presentation-only).
-- **practice_sessions / exercise_attempts** — each attempt's verdict, latency/duration, tap-sync score, rung_at_attempt, tier_at_attempt, **tempo_bpm** (v20: beat reference at capture, for onset-vs-beat steadiness), encrypted audio path (nulled after 48 h), synced_at.
-- **tap_events** (v19, ML logging item 16a) — the **raw per-tap stream**: one row per tap (touch-down time, dwell = press duration, beat phase at touch-down), tied to attempt/phrase/rung/session. This is the un-aggregated data the fatigue detector needs (dwell trend + inter-tap-interval variance) — the single tap-sync score on the attempt row can't reconstruct it. **Derived non-audio data → never evicted** (kept beyond the 48 h audio window). Indexed by attempt and by session.
-- **acoustic_feature_vectors** — per-attempt gate verdict + DTW similarity, plus (v20) **mfcc_distance** (the raw un-squashed DTW cost behind the similarity, item 16b) and **onset_ms** (the patient's own detected syllable onsets, CSV, item 16c). Written for the clean-capture rungs (r4–r6), where a solo clip exists. *(r1–r3 open no mic — model/hum would bleed — so they have a caregiver label + tap stream but no acoustic vector, by design.)*
+- **user_profiles** — one local profile; all preferences (tempo, channels, session/recording length, consent + timestamp, target_display, playback_speed, auto_progress_enabled, onboarding_seen, demo_mode_enabled, solo_mode_enabled, cloud_profile_id), **mit_level** (v28: the PATIENT's Level I/II/III — the only thing progression carries between sessions), **practice_target_minutes** (v30: the caregiver's dose goal, minutes a day), and the home-screen plant's **plant_stage** + **plant_grown_on** (v32: how grown it is, and the last local day it grew, so a second session the same afternoon can't count twice).
+- **practice_phrases** — text, word/syllable counts, complexity_level, guide_clip_path (encrypted reference) + guide_nuclei_ms, photo_path, **probe_question_text/_clip_path** (v21), **stress_index** (high-note syllable for the melody, v22), sprechgesang_clip_path (v25), is_active, **is_starter** (v27; presentation-only).
+- **practice_sessions / exercise_attempts** — each production's verdict, latency/duration, tap-sync score, **step_at_attempt** (v28: the `MitStep` index), **tempo_bpm** (v20: beat reference at capture), encrypted audio path (nulled after 48 h), synced_at; plus **practice_sessions.ended_at** (v31: stamped on every attempt save, so practice dose can be measured in minutes a day rather than inferred from the second-to-last attempt).
+- **tap_events** (v19, ML logging item 16a) — the **raw per-tap stream**: one row per tap (touch-down time, dwell = press duration, beat phase at touch-down), tied to attempt/phrase/**step**/session. This is the un-aggregated data the fatigue detector needs (dwell trend + inter-tap-interval variance) — the single tap-sync score on the attempt row can't reconstruct it. **Derived non-audio data → never evicted.** Indexed by attempt and by session.
+- **acoustic_feature_vectors** — per-attempt gate verdict + DTW similarity, plus (v20) **mfcc_distance** and **onset_ms** (the patient's own detected syllable onsets, CSV). Written for the three clean-capture steps. *(Unison steps open no mic — the model would bleed — so they have a caregiver label + tap stream but no acoustic vector, by design.)*
 - **phrase_anchor_templates** — per-(profile,phrase) MFCC reference (derived features, never audio).
-- **progression_state** — per-(profile,phrase) rung, syllable_tier, tempo_bpm.
 - **daily_summary** — per-(profile,day) metrics rollup.
 
-*(Legacy/unused: `practice_phrases.audio_asset_path`, `exercise_attempts.support_level`.)*
+**v28, the MIT revert.** `progression_state` (per-word rung, syllable tier, per-word tempo) is **dropped** — all three concepts are gone. `tap_events.rung` is **rebuilt** as a nullable `step` (the column was `NOT NULL`, so it could not simply stop being written); existing taps are preserved with a NULL step. `exercise_attempts.rung_at_attempt` was **not** reinterpreted as a step — a new `step_at_attempt` column was added instead, because relabelling old rung integers would write wrong data into the very history the level criterion reads. The other dead columns (`practice_phrases.current_rung`, `rung_at_attempt`, `tier_at_attempt`, `user_profiles.session_rung_cap`) are gone from the fresh-install schema and read nowhere, but are **left in place on upgraded databases**: SQLite only learned `DROP COLUMN` in 3.35 and Android ships what it ships.
 
-**ML-logging status (audit item 16 — complete):** the raw tap stream (16a, dwell + inter-tap timing), the per-attempt acoustic vector with both DTW similarity and raw MFCC distance (16b), and the patient's own syllable onsets + beat reference (16c) are all captured and kept past the 48 h audio eviction — enough to reconstruct dwell/ITI-variance fatigue signals and onset-vs-beat vocal steadiness offline. All are logged data only; **none gates progression** (still caregiver-in-the-loop). The downstream consumers (fatigue detector 17, Layer C classifier 18, dashboard 20) are not yet built.
+*(Legacy/unused: `practice_phrases.audio_asset_path`, `exercise_attempts.support_level`, and — on upgraded databases only — the v28 leftovers above.)*
+
+**ML-logging status (audit item 16 — complete):** the raw tap stream (16a, dwell + inter-tap timing), the per-attempt acoustic vector with both DTW similarity and raw MFCC distance (16b), and the patient's own syllable onsets + beat reference (16c) are all captured and kept past the 48 h audio eviction. All are logged data only; **none gates anything** (still caregiver-in-the-loop).
 
 ---
 
 ## 14. Testing
 
-**338 tests passing** (`flutter test`, +1 skipped), covering: WAV codec, MFCC, DTW, junk gate, MFCC codec, attempt analyzer/scoring (incl. raw MFCC distance + patient-onset capture), time-stretch, syllable detection, **pitch (F0) detection + intonation-contour analysis** (relative-stress + "good enough" acceptance) + **reference-melody synthesis**, noise reduction, audio trim, AES crypto, audio eviction; the metronome/beat scheduler (incl. **stale-beat suppression** so a stalled frame never replays overdue ticks), tap-sync; the practice controller FSM including the **warm-up (tap→hum) state and the "tapping can never advance a word" guarantee**, the raw tap-stream capture (touch-down + dwell) and the deferred-R7 routing, progression (**warm-up vs active R2–R6 ladder**, every word rung judged, `raisedActive`/`loweredActive` clamps, MIT 3-rep block, tier gate @ 10 sessions @ top-rung R6, auto-progression, progression service); repository + anchors + tap_events + probe-question + stress-index + schema migrations (**v1→v27**, incl. v23 syllable-count→level/tier reconciliation, v24 solo-mode flag, v25 sprechgesang col + daily-summary indexes, **v26 rung-reconcile into the active [R2, R6] ladder**, **v27 is_starter + idempotent starter-library seeding**) + syllable-count→level mapping + **unison entry rung** + tier-cap + the park-and-switch/end-on-success session-queue mechanics + the **starter word library** (manifest, seeding/idempotence, structural parity, eviction-safety, deprioritize ordering, no-branch guarantee); **ML scaffolding — fatigue detector (drift over tap/dwell/onset regularity), Wilson-lower-bound graduation gate, Layer C feature assembly + untrained-abstain, scoped-solo policy, and the insights dashboard assembly**; the Sprechgesang L3 gate, the off-thread scoring isolate parity (incl. the **production path where the worker reads and decrypts the clips itself**, and a soft failure on an unreadable clip), and the eviction-keeps-derived-data guarantee; sync service; analytics/trends + capture analysis + history; **per-screen orientation** (route→orientation classification + observer channel calls, item 4) and the **two-demo melody teaching** step (item 5); and widget tests (practice view incl. the **warm-up tap/hum arenas**, melody cue, settings, metronome screen, slide-to-unlock).
+**429 tests passing** (`flutter test`, +1 skipped), `flutter analyze` clean.
 
-The pure logic (audio DSP, progression rules, analytics, data layer) is unit-tested. **Device-gated** parts — live mic recording, audio playback/TTS, gallery photo pick, keystore — are verified on a physical device rather than in tests.
+Covering: WAV codec, MFCC, DTW, junk gate, MFCC codec, attempt analyzer/scoring (incl. raw MFCC distance + patient-onset capture), time-stretch, syllable detection, **pitch (F0) detection + intonation-contour analysis** + **reference-melody synthesis**, noise reduction, audio trim, AES crypto, audio eviction; the metronome/beat scheduler (incl. **stale-beat suppression** so a stalled frame never replays overdue ticks), tap-sync. *(The pitch/contour/noise-reduction/trim tests now outlive their production caller — see §5: the libs are retained for owner-side authoring, and their tests are what keeps them honest.)*
+
+**The MIT sequence** (`mit_sequence_test.dart`, `practice_controller_test.dart`): the step tables per level, the **2-of-3 `RepRule`** (two passes stop at two; two fails stop at two; doubt costs a third; three Unsures fail safe), `MitItemRun`'s **immediate back-up** and **set-aside**, `LevelCriterion`, and the controller FSM driving all of it — Level I never opening a mic, Level II's five steps walked in one sitting, Level III's retrieval-only pair, the step→state routing, the unjudged hum step (once per **item**, safety-cap release, skippable), the warm-up's "tapping can never move the sequence" guarantee, the raw tap-stream capture (touch-down + dwell) resetting **per production**, the attempt carrying its **own** step + rep number, the phrase-locked tapping window, and the presenter's step jump leaving no record.
+
+Plus: `step_timing_test.dart` pinning the **six-second** delayed repeat as a protocol constant; repository + anchors + tap_events + probe-question + stress-index; **schema migrations v1→v30**, including a real **v27→v28** test (mit_level added and defaulting to Level II, `progression_state` dropped, old attempts keeping a NULL step rather than a relabelled rung) and the **tap_events rebuild** (every tap preserved, step NULL, cascade + indexes intact); the **starter word library**; **ML scaffolding** — fatigue detector, Wilson-lower-bound graduation gate, Layer C feature assembly + untrained-abstain, scoped-solo policy keyed on the probe step, insights dashboard; the off-thread scoring isolate parity and the eviction-keeps-derived-data guarantee; sync service; analytics/trends + capture analysis + history; **per-screen orientation**; the **practice dose** rollup and the **plant**'s growth/clamp rules; and widget tests (practice view incl. the warm-up tap/hum arenas, the word withheld during the hum, the per-step stage chip, melody cue, slide-to-unlock, session/sensory settings, the tapping tutorial, the level-up offer). `caregiver_panel_test.dart` asserts **every caregiver screen still has a row pointing at it** — the guard that was missing when five screens lost their entry points (see `DEPRECATIONS.md` §7).
+
+**Known test gaps:** **v31 and v32 have no dedicated migration test** (the per-version convention stops at v30) — both are `_addColumnIfMissing` column adds, which is the lowest-risk migration shape, but the convention is otherwise unbroken. The deleted screens took `metronome_screen_test.dart` and `guide_recording_teach_test.dart` (the two-demo melody teaching step) with them; `mit_progression_test.dart`, `progression_test.dart` and `progression_log_sim_test.dart` — 526 lines testing the deleted ladder — went at the v28 revert.
+
+The pure logic (audio DSP, MIT rules, analytics, data layer) is unit-tested. **Device-gated** parts — live mic recording, audio playback/TTS, gallery photo pick, keystore — are verified on a physical device rather than in tests.
 
 ---
 
 ## 15. Status & honest caveats
-- **Verified on device:** the guide audio plays; the core practice loop runs.
-- **Built, awaiting device verification:** gallery photo pick + display, ambient calibration feel, the full MIT 3-rep-block progression end-to-end, the daily-summary cloud push (needs the Supabase `daily_summaries` table created).
-- **Known not-yet-done:** the **full piecewise** voice-to-beat warp (each syllable landing exactly on a beat, with beat-synced playback start) — the current alignment matches *average* pacing to the beat; the family-facing cloud read of daily summaries.
+- **Verified on device:** the guide audio plays; the core practice loop runs. **Nothing since the MIT fidelity pass is device-verified** — that includes the whole v28 revert, the new home screen/plant, the caregiver panel and every screen imported with it.
+- **Built, awaiting device verification:** the full MIT sequence end-to-end (back-up, set-aside, level advancement), gallery photo pick + display, ambient calibration feel, the per-beat syllable illumination on the staff (the beat anchor is exact in code but has never been watched against real audio), the daily-summary cloud push (needs the Supabase `daily_summaries` table created).
+- **Known not-yet-done:** the **full piecewise** voice-to-beat warp (each syllable landing exactly on a beat, with beat-synced playback start) — the current alignment matches *average* pacing to the beat; the authored Sprechgesang clips (the fallback voice stands in); real starter-library audio (the bundled `.wav`s are marked placeholders).
+- **No cloud surface:** sync + Supabase plumbing is live but **nothing can sign in** since `account_screen.dart` was removed, so the metrics push is dormant (§11). Consent is still recorded and still gates it.
+- **Retained-but-uncalled code:** the guide-recording DSP (`pitch_detection`, `intonation_contour`, `noise_reduction`, `audio_trim`) has no production caller now that the in-app recorder is gone (§5). Kept deliberately, with its tests.
