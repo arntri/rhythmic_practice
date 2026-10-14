@@ -19,14 +19,14 @@ spoken alone. It is one of the few aphasia therapies with real evidence behind
 it, and it is delivered by a clinician, intensively, for months.
 
 AphasiaAid puts that protocol in the hands of a family member sitting beside the
-patient. The app is the clinician's *structure* — the beat, the melody, the step
+patient. The app is the clinician's *structure.* The beat, the melody, the step
 sequence, the record of what happened. The caregiver remains the one who judges
 every attempt.
 
 ## What it does
 
 - **Runs MIT's actual step sequence.** Each phrase goes through the whole
-  sequence for the patient's level in one sitting — hum the melody, intone in
+  sequence for the patient's level in one sitting. Hum the melody, intone in
   unison, carry it as the model fades, repeat after a delay, answer a question
   with it, then speak it without the tune. A failed step backs up to an easier
   one *immediately*; two failures set the phrase aside for the day.
