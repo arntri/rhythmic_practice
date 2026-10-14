@@ -4,6 +4,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 import 'package:rhythmic_practice/analytics/trend.dart';
 import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
@@ -32,7 +33,7 @@ void main() {
 
   tearDown(() => db.close());
 
-  // A session with [passes] passes out of [total] judged attempts (rung r5).
+  // A session with [passes] passes out of [total] judged attempts.
   Future<void> sessionWith(int passes, int total) async {
     final sid = await repo.createSession(profileId);
     for (var i = 0; i < total; i++) {
@@ -40,7 +41,7 @@ void main() {
         sessionId: sid,
         phraseId: phraseId,
         evaluationLabel: i < passes ? 1 : 0,
-        rungAtAttempt: 5,
+        stepAtAttempt: MitStep.delayedRepeat.index,
       );
     }
   }
@@ -79,7 +80,7 @@ void main() {
         sessionId: sid,
         phraseId: phraseId,
         evaluationLabel: 1,
-        rungAtAttempt: 5,
+        stepAtAttempt: MitStep.delayedRepeat.index,
       );
       await db.insert('acoustic_feature_vectors', {
         'vector_id': 'v_$sim',

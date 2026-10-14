@@ -4,7 +4,7 @@ import '../analytics/trend.dart';
 import '../data/models.dart';
 import '../data/practice_repository.dart';
 import '../services/progress_analytics.dart';
-import 'ml_insights_screen.dart';
+import 'insights_screen.dart';
 
 /// Offline history for the caregiver: how each phrase is going over time, and a
 /// list of recent sessions. Reads only the local database, so it works with no
@@ -73,7 +73,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
             icon: const Icon(Icons.insights_outlined),
             tooltip: 'Insights (experimental)',
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) => MlInsightsScreen(repository: _repo),
+              builder: (_) => InsightsScreen(repository: _repo),
             )),
           ),
           IconButton(

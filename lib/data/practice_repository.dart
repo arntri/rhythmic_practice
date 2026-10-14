@@ -5,9 +5,9 @@ import 'package:uuid/uuid.dart';
 
 import '../analysis/attempt_analyzer.dart';
 import '../analysis/mfcc_codec.dart';
-import '../practice/mit_progression.dart';
 import '../practice/practice_controller.dart' show TapEvent;
-import '../practice/progression.dart';
+import '../practice/mit_sequence.dart';
+import '../practice/syllable_estimate.dart';
 import 'app_database.dart';
 import 'models.dart';
 
@@ -21,10 +21,6 @@ class PracticeRepository {
   final AppDatabase _appDb;
   final Database? _explicitDb;
   static const _uuid = Uuid();
-
-  /// Sentinel for nullable [updateProfile] params: distinguishes "leave
-  /// unchanged" (the default) from an explicit "set to null".
-  static const Object _unset = Object();
 
   PracticeRepository([AppDatabase? appDb])
       : _appDb = appDb ?? AppDatabase.instance,
@@ -70,7 +66,8 @@ class PracticeRepository {
     bool? onboardingSeen,
     TargetDisplay? targetDisplay,
     double? playbackSpeed,
-    Object? sessionRungCap = _unset,
+    MitLevel? mitLevel,
+    int? practiceTargetMinutes,
     bool? demoModeEnabled,
     bool? soloModeEnabled,
   }) async {
@@ -87,9 +84,8 @@ class PracticeRepository {
       if (onboardingSeen != null) 'onboarding_seen': onboardingSeen ? 1 : 0,
       if (targetDisplay != null) 'target_display': targetDisplay.name,
       'playback_speed': ?playbackSpeed,
-      // Nullable: passing null clears the cap; the _unset default leaves it.
-      if (!identical(sessionRungCap, _unset))
-        'session_rung_cap': sessionRungCap as int?,
+      if (mitLevel != null) 'mit_level': mitLevel.index,
+      'practice_target_minutes': ?practiceTargetMinutes,
       if (demoModeEnabled != null)
         'demo_mode_enabled': demoModeEnabled ? 1 : 0,
       if (soloModeEnabled != null)
@@ -128,14 +124,10 @@ class PracticeRepository {
     int? stressIndex,
   }) async {
     final db = await _db;
-    // Set the phrase's ENTRY rung from its level (audit item 13) — but ONLY when
-    // the word has never been practised (no progression_state row), so
-    // re-recording a guide for a word already climbing the ladder never resets
-    // its rung. The level is derived from the just-confirmed syllable count.
-    final progressed = (await db.query('progression_state',
-            where: 'phrase_id = ?', whereArgs: [phraseId], limit: 1))
-        .isNotEmpty;
-    final entryRung = entryRungForLevel(levelForSyllableCount(syllableCount));
+    // Confirming a guide no longer touches progression. Under the old ladder
+    // this set the word's entry rung from its syllable count; a word has no
+    // resting rung now — every item runs its level's whole sequence — so there
+    // is nothing here to seed.
     await db.update(
       'practice_phrases',
       {
@@ -143,7 +135,6 @@ class PracticeRepository {
         'syllable_count': syllableCount,
         'guide_nuclei_ms': nucleiMs.join(','),
         'stress_index': ?stressIndex, // written only when provided (null skips)
-        if (!progressed) 'current_rung': entryRung.level,
       },
       where: 'phrase_id = ?',
       whereArgs: [phraseId],
@@ -184,11 +175,17 @@ class PracticeRepository {
     final db = await _db;
     final trimmed = text.trim();
     final wordCount = trimmed.isEmpty ? 0 : trimmed.split(RegExp(r'\s+')).length;
+    // A first ESTIMATE of the syllable count, so a new phrase has a sensible
+    // length band and a melody to hum from the moment it is added. It used to
+    // sit at 0 until a guide was recorded, which meant a caregiver's own phrase
+    // hummed as a single note however long it was. The authored guide still
+    // overwrites this with the real count when it arrives.
+    final syllables = estimateSyllables(trimmed);
     return db.insert('practice_phrases', {
       'phrase_text': trimmed,
       'word_count': wordCount,
-      'syllable_count': 0, // set from beats when its guide is recorded
-      'complexity_level': wordCount > 1 ? 3 : 1,
+      'syllable_count': syllables,
+      'complexity_level': lengthBand(syllables),
       'is_active': 1,
     });
   }
@@ -232,67 +229,21 @@ class PracticeRepository {
     );
   }
 
-  // --- Phase 3 progression state (per profile, per phrase) -----------------
+  // --- Progression (the patient's MIT level) --------------------------------
 
-  /// The MIT progression record for (profile, phrase), or a fresh default if none
-  /// has been stored yet. The default's **syllable tier is seeded from the
-  /// phrase's syllable count** (audit item 12, [levelForSyllableCount]) — a
-  /// longer phrase starts at a higher linguistic-load level — while the rung and
-  /// tempo take their usual defaults (R2 / 60 BPM).
-  Future<ProgressionState> getProgressionState(
-      String profileId, int phraseId) async {
-    final db = await _db;
-    final rows = await db.query(
-      'progression_state',
-      where: 'profile_id = ? AND phrase_id = ?',
-      whereArgs: [profileId, phraseId],
-      limit: 1,
-    );
-    if (rows.isEmpty) {
-      final phrase = await db.query('practice_phrases',
-          columns: ['syllable_count'],
-          where: 'phrase_id = ?',
-          whereArgs: [phraseId],
-          limit: 1);
-      final count =
-          phrase.isEmpty ? 0 : (phrase.first['syllable_count'] as int? ?? 0);
-      return ProgressionState(
-        profileId: profileId,
-        phraseId: phraseId,
-        syllableTier: levelForSyllableCount(count),
-      );
-    }
-    return ProgressionState.fromMap(rows.first);
-  }
-
-  /// Persist the durable part of a progression record (rung / tier / tempo).
-  Future<void> upsertProgressionState(ProgressionState state) async {
-    final db = await _db;
-    await db.insert(
-      'progression_state',
-      {
-        'profile_id': state.profileId,
-        'phrase_id': state.phraseId,
-        'current_rung': state.rung.level,
-        'syllable_tier': state.syllableTier,
-        'tempo_bpm': state.bpm,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  /// Per-session pass-rate history over solo rungs at or above [minRung]
-  /// (default 4 = r4–r7; the tier gate passes the top rung's level for top-rung-
-  /// only mastery),
-  /// oldest → newest. Each entry is passes / (passes + fails) for that session,
-  /// ignoring Unsure. With a [phraseId] it's that word's history (feeds the
-  /// slow-loop tier gate, [MitProgression.shouldRaiseTier]); without one it's
-  /// the overall history (display-only analytics). With [tier] set, only attempts
-  /// produced at that syllable tier count — so the tier gate measures mastery
-  /// within the CURRENT tier and old top-rung rows from a previous tier don't
-  /// re-trigger a promotion.
+  /// Per-session pass rate across judged productions, oldest → newest. Each entry
+  /// is passes / (passes + fails) for that session, ignoring Unsure.
+  ///
+  /// This is what [LevelCriterion] reads: MIT's ~90% is a criterion for moving
+  /// the PERSON up a level, so the default is every judged production of the
+  /// session, not a slice of one word at one rung. (The old signature filtered by
+  /// `rung_at_attempt >= minRung` and by syllable tier, because the number was
+  /// being spent on a per-word tier gate — the thing the revert removes.)
+  ///
+  /// [phraseId] narrows it to one item, for display-only analytics; [step]
+  /// narrows it to productions at one MIT step.
   Future<List<double>> sessionPassRates(String profileId,
-      {int? phraseId, int minRung = 4, int? tier}) async {
+      {int? phraseId, MitStep? step}) async {
     final db = await _db;
     final rows = await db.rawQuery('''
       SELECT SUM(CASE WHEN a.evaluation_label = 1 THEN 1 ELSE 0 END) AS passes,
@@ -300,14 +251,136 @@ class PracticeRepository {
       FROM exercise_attempts a
       JOIN practice_sessions s ON a.session_id = s.session_id
       WHERE s.profile_id = ? ${phraseId != null ? 'AND a.phrase_id = ?' : ''}
-        AND a.rung_at_attempt >= ? AND a.evaluation_label IN (0, 1)
-        ${tier != null ? 'AND a.tier_at_attempt = ?' : ''}
+        AND a.evaluation_label IN (0, 1)
+        ${step != null ? 'AND a.step_at_attempt = ?' : ''}
       GROUP BY a.session_id
       ORDER BY MIN(a.rowid) ASC
-    ''', [profileId, ?phraseId, minRung, ?tier]);
+    ''', [profileId, ?phraseId, ?step?.index]);
     return [
       for (final r in rows) (r['passes'] as int) / (r['judged'] as int),
     ];
+  }
+
+  /// Grow the plant, if it has not already grown today.
+  ///
+  /// Returns the stage after the call — the same value it was if today has
+  /// already counted, or the plant is fully grown. Cumulative and one-way by
+  /// construction: there is no path in the app that lowers it.
+  ///
+  /// [today] is injected so this is testable without waiting for midnight, and
+  /// it is a **local** date: a session at 11pm belongs to the evening the family
+  /// remembers, not to tomorrow.
+  Future<int> growPlant(String profileId, {DateTime? today}) async {
+    final db = await _db;
+    final now = today ?? DateTime.now();
+    final day =
+        '${now.year.toString().padLeft(4, '0')}-'
+        '${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
+
+    final rows = await db.query(
+      'user_profiles',
+      columns: ['plant_stage', 'plant_grown_on'],
+      where: 'profile_id = ?',
+      whereArgs: [profileId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return 0;
+    final stage = ((rows.first['plant_stage'] as int?) ?? 0).clamp(0, 4);
+    final grownOn = rows.first['plant_grown_on'] as String?;
+
+    if (grownOn == day || stage >= 4) return stage;
+    final next = stage + 1;
+    await db.update(
+      'user_profiles',
+      {'plant_stage': next, 'plant_grown_on': day},
+      where: 'profile_id = ?',
+      whereArgs: [profileId],
+    );
+    return next;
+  }
+
+  /// Minutes practised per day over the last [days] days, keyed 'YYYY-MM-DD'.
+  ///
+  /// A day's minutes are the sum of its sessions' spans — `started_at` to
+  /// `ended_at`, so the warm-up and the last production are both inside it.
+  /// Sessions that never recorded an attempt have no `ended_at` and contribute
+  /// nothing, which is right: opening the app is not practice.
+  ///
+  /// Local dates, not UTC. A session at 11pm belongs to the evening the family
+  /// remembers, and a dose display that quietly moved half of them to the next
+  /// day would be wrong in the way that is hardest to notice.
+  Future<Map<String, int>> minutesPerDay(String profileId,
+      {int days = 28}) async {
+    final db = await _db;
+    final rows = await db.rawQuery('''
+      SELECT date(started_at, 'localtime') AS day,
+             SUM(MAX(0, strftime('%s', ended_at) - strftime('%s', started_at)))
+               AS seconds
+      FROM practice_sessions
+      WHERE profile_id = ?
+        AND ended_at IS NOT NULL
+        AND started_at >= date('now', ?)
+      GROUP BY day
+    ''', [profileId, '-$days day']);
+    return {
+      for (final r in rows)
+        r['day'] as String: (((r['seconds'] as num?) ?? 0) / 60).round(),
+    };
+  }
+
+  /// Pass rate at each MIT step, across everything logged for [profileId].
+  ///
+  /// **The most useful number the app has for a caregiver**, and the only place
+  /// a rate is shown at all — to them, never to the patient. A step sitting low
+  /// is where the work is: it is the one they keep backing up from, and knowing
+  /// which one it is tells them what to bring to a speech therapist.
+  ///
+  /// Unsure is excluded from both halves: "we could not tell" is not evidence
+  /// either way. Steps with nothing logged are absent rather than zero — no
+  /// history is not a bad score.
+  Future<Map<MitStep, ({int passes, int judged})>> passRateByStep(
+    String profileId,
+  ) async {
+    final db = await _db;
+    final rows = await db.rawQuery('''
+      SELECT a.step_at_attempt AS step,
+             SUM(CASE WHEN a.evaluation_label = 1 THEN 1 ELSE 0 END) AS passes,
+             COUNT(*) AS judged
+      FROM exercise_attempts a
+      JOIN practice_sessions s ON a.session_id = s.session_id
+      WHERE s.profile_id = ?
+        AND a.evaluation_label IN (0, 1)
+        AND a.step_at_attempt IS NOT NULL
+      GROUP BY a.step_at_attempt
+    ''', [profileId]);
+    return {
+      for (final r in rows)
+        if ((r['step'] as int) < MitStep.values.length)
+          MitStep.values[r['step'] as int]: (
+            passes: (r['passes'] as int?) ?? 0,
+            judged: (r['judged'] as int?) ?? 0,
+          ),
+    };
+  }
+
+  /// How many sessions have been run, and when the first one was — for the
+  /// "14 sessions · 6 weeks practising" line. Both null-safe on a fresh install.
+  Future<({int sessions, DateTime? firstAt})> practiceSpan(
+    String profileId,
+  ) async {
+    final db = await _db;
+    final rows = await db.rawQuery(
+      'SELECT COUNT(*) AS n, MIN(started_at) AS first FROM practice_sessions '
+      'WHERE profile_id = ?',
+      [profileId],
+    );
+    final row = rows.first;
+    final first = row['first'] as String?;
+    return (
+      sessions: (row['n'] as int?) ?? 0,
+      firstAt: first == null ? null : DateTime.tryParse(first),
+    );
   }
 
   // --- Progress analytics (display-only — never feeds progression) ----------
@@ -345,26 +418,16 @@ class PracticeRepository {
     return [for (final r in rows) (r['lat'] as num).toDouble()];
   }
 
-  /// Sets the caregiver-chosen progression rung (MIT ladder, §4) for a phrase.
-  Future<void> setRung(int phraseId, Rung rung) async {
-    final db = await _db;
-    await db.update(
-      'practice_phrases',
-      {'current_rung': rung.level},
-      where: 'phrase_id = ?',
-      whereArgs: [phraseId],
-    );
-  }
-
-  /// Resets the whole ladder back to the start: every phrase to the unison entry
-  /// ([entryRung] = R2 — tapping/humming are the warm-up, not word rungs) and the
-  /// per-phrase tier/tempo cleared (so [getProgressionState] returns defaults).
-  /// For starting a fresh run-through from the beginning of the progression.
+  /// Starts the progression over: the patient goes back to MIT's first level.
+  ///
+  /// That is the whole of it now. Under the ladder this also had to walk every
+  /// phrase back to its entry rung and clear a per-word tier and tempo; with the
+  /// sequence fixed by the level, the person's level IS the progression.
   Future<void> resetProgression(String profileId) async {
     final db = await _db;
-    await db.update('practice_phrases', {'current_rung': entryRung.level});
-    await db.delete(
-      'progression_state',
+    await db.update(
+      'user_profiles',
+      {'mit_level': MitLevel.one.index},
       where: 'profile_id = ?',
       whereArgs: [profileId],
     );
@@ -457,8 +520,7 @@ class PracticeRepository {
     int? latencyMs,
     int? durationMs,
     String? localEncryptedAudioPath,
-    int? rungAtAttempt,
-    int? tierAtAttempt,
+    int? stepAtAttempt,
     int? tempoBpm,
   }) async {
     final db = await _db;
@@ -472,23 +534,31 @@ class PracticeRepository {
       'tapping_synchronization_score': tappingSynchronizationScore,
       'evaluation_label': evaluationLabel,
       'local_encrypted_audio_path': localEncryptedAudioPath,
-      'rung_at_attempt': rungAtAttempt,
-      'tier_at_attempt': tierAtAttempt,
+      'step_at_attempt': stepAtAttempt, // v28: the MIT step it was produced at
       'tempo_bpm': tempoBpm, // v20: beat reference at capture (item 16c)
     });
+    // v31: stamp the session as still running. Doing it per attempt (rather than
+    // once at the end) means a session that is abandoned mid-way still records
+    // how long it actually ran, and the span covers the last production instead
+    // of stopping at the second-to-last attempt.
+    await db.rawUpdate(
+      "UPDATE practice_sessions SET ended_at = datetime('now') "
+      'WHERE session_id = ?',
+      [sessionId],
+    );
     return attemptId;
   }
 
   /// Persist the raw per-tap stream for one attempt (ML logging audit item 16a):
   /// one `tap_events` row per [TapEvent], carrying its touch-down time, dwell, and
-  /// beat phase, tied to [attemptId]/[phraseId]/[sessionId]/[rung]. A no-op when
+  /// beat phase, tied to [attemptId]/[phraseId]/[sessionId]/[step]. A no-op when
   /// there were no taps. Batched into one round-trip. Unlike audio, these derived
   /// features are never evicted — this is the fatigue detector's future input.
   Future<void> insertTapEvents({
     required String attemptId,
     required int phraseId,
     required String sessionId,
-    required int rung,
+    required MitStep? step,
     required List<TapEvent> taps,
   }) async {
     if (taps.isEmpty) return;
@@ -501,7 +571,7 @@ class PracticeRepository {
         'attempt_id': attemptId,
         'phrase_id': phraseId,
         'session_id': sessionId,
-        'rung': rung,
+        'step': step?.index,
         'tap_index': i,
         'down_ms': t.downMs,
         'dwell_ms': t.dwellMs,

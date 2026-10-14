@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import '../data/models.dart';
+import '../practice/mit_sequence.dart';
 
 /// **Layer C** — the (future) learned verdict classifier (audit item 18).
 ///
@@ -34,9 +35,9 @@ class UntrainedLayerC implements LayerCClassifier {
 
 /// The feature vector Layer C would consume — assembled entirely from data we
 /// already log (never raw audio): the caregiver-independent acoustic scores plus
-/// the motor-timing summaries plus the rung/tier/tempo context. All fields are
-/// nullable because any given attempt may be missing a channel (e.g. no clean
-/// capture on a unison rung, or no taps).
+/// the motor-timing summaries plus the MIT step/level/tempo context. All fields
+/// are nullable because any given attempt may be missing a channel (e.g. no
+/// clean capture at a unison step, or no taps).
 class LayerCFeatures {
   const LayerCFeatures({
     this.contentSimilarity,
@@ -47,8 +48,8 @@ class LayerCFeatures {
     this.itiCoefficientOfVariation,
     this.meanDwellMs,
     this.onsetSteadiness,
-    required this.rung,
-    this.tier,
+    this.step,
+    this.level,
     this.tempoBpm,
   });
 
@@ -60,17 +61,23 @@ class LayerCFeatures {
   final double? itiCoefficientOfVariation; // motor steadiness (lower = steadier)
   final double? meanDwellMs;
   final double? onsetSteadiness; // 0..1, higher = more even vocal onsets
-  final int rung;
-  final int? tier;
+  /// The MIT step this production was made at — the difficulty context that
+  /// replaced the ladder rung. Null for attempts logged before v28, whose rung
+  /// numbers no longer decode to anything.
+  final MitStep? step;
+
+  /// The patient's MIT level at the time, when known.
+  final MitLevel? level;
   final int? tempoBpm;
 
   /// Assemble features for one attempt from its logged rows (pure). [taps] is the
-  /// attempt's raw tap stream; [vector] its acoustic feature row (may be null on
-  /// rungs that don't record).
+  /// attempt's raw tap stream; [vector] its acoustic feature row (may be null at
+  /// steps that don't record).
   factory LayerCFeatures.fromLoggedAttempt({
     required ExerciseAttempt attempt,
     FeatureVector? vector,
     List<StoredTapEvent> taps = const [],
+    MitLevel? level,
   }) {
     // Inter-tap-interval coefficient of variation (motor steadiness).
     final downs = ([for (final t in taps) t.downMs]..sort());
@@ -90,8 +97,8 @@ class LayerCFeatures {
           ? null
           : dwells.reduce((a, b) => a + b) / dwells.length,
       onsetSteadiness: _onsetSteadiness(vector?.onsetMs ?? const []),
-      rung: attempt.rungAtAttempt ?? 0,
-      tier: attempt.tierAtAttempt,
+      step: attempt.step,
+      level: level,
       tempoBpm: attempt.tempoBpm,
     );
   }

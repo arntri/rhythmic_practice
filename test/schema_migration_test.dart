@@ -210,7 +210,7 @@ void main() {
     expect(prof['capture_silence_ms'], 4500); // default applied
   });
 
-  test('fresh install (applyInitialSchema) has the v7 columns', () async {
+  test('fresh install (applyInitialSchema) has the v7 guide columns', () async {
     final db = await databaseFactoryFfi.openDatabase(
       inMemoryDatabasePath,
       options: OpenDatabaseOptions(
@@ -221,7 +221,6 @@ void main() {
     );
     addTearDown(db.close);
     expect((await db.query('user_profiles')).first['capture_silence_ms'], 4500);
-    expect((await db.query('practice_phrases', limit: 1)).first['current_rung'], 2);
     final phrase = (await db.query('practice_phrases', limit: 1)).first;
     expect(phrase.containsKey('guide_clip_path'), isTrue);
     expect(phrase.containsKey('guide_nuclei_ms'), isTrue);
@@ -494,66 +493,6 @@ void main() {
     expect(a['support_level'], 2);
   });
 
-  test('v14 → v15 resets legacy-inflated rungs but keeps controller-managed ones',
-      () async {
-    // Build the current schema but stamp it as v14, so reopening triggers only
-    // the v15 reconcile step.
-    final v14 = await databaseFactoryFfi.openDatabase(
-      path,
-      options: OpenDatabaseOptions(
-        version: 14,
-        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-        onCreate: (db, v) => AppDatabase.applyInitialSchema(db),
-      ),
-    );
-    // A word stranded at R6 by the removed per-attempt engine (NO progression
-    // record) — should be reset to the unison default.
-    final legacyId = await v14.insert('practice_phrases', {
-      'phrase_text': 'Legacy',
-      'word_count': 1,
-      'syllable_count': 1,
-      'complexity_level': 1,
-      'current_rung': 6,
-    });
-    // A word the live block controller manages (HAS a progression record at R5,
-    // mirrored to current_rung) — must be left untouched.
-    final managedId = await v14.insert('practice_phrases', {
-      'phrase_text': 'Managed',
-      'word_count': 1,
-      'syllable_count': 1,
-      'complexity_level': 1,
-      'current_rung': 5,
-    });
-    await v14.insert('progression_state', {
-      'profile_id': AppDatabase.defaultProfileId,
-      'phrase_id': managedId,
-      'current_rung': 5,
-      'syllable_tier': 1,
-      'tempo_bpm': 60,
-    });
-    await v14.close();
-
-    final db = await databaseFactoryFfi.openDatabase(
-      path,
-      options: OpenDatabaseOptions(
-        version: 15,
-        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-        onUpgrade: AppDatabase.migrate,
-      ),
-    );
-    addTearDown(db.close);
-
-    final legacy = (await db.query('practice_phrases',
-            where: 'phrase_id = ?', whereArgs: [legacyId]))
-        .single;
-    expect(legacy['current_rung'], 2); // legacy R6 reset to unison
-
-    final managed = (await db.query('practice_phrases',
-            where: 'phrase_id = ?', whereArgs: [managedId]))
-        .single;
-    expect(managed['current_rung'], 5); // controller-managed rung preserved
-  });
-
   test('v1 → v16 adds tier_at_attempt on exercise_attempts (NULL for old rows)',
       () async {
     final v1 = await databaseFactoryFfi.openDatabase(
@@ -665,7 +604,7 @@ void main() {
       'attempt_id': 'a1',
       'phrase_id': phraseId,
       'session_id': 's1',
-      'rung': 4,
+      'step': 4,
       'tap_index': 0,
       'down_ms': 100,
       'dwell_ms': 55,
@@ -674,7 +613,7 @@ void main() {
     final row = (await db.query('tap_events')).single;
     expect(row['down_ms'], 100);
     expect(row['dwell_ms'], 55);
-    expect(row['rung'], 4);
+    expect(row['step'], 4);
 
     // Deleting the attempt cascades its taps (foreign key ON DELETE CASCADE).
     await db.delete('exercise_attempts', where: 'attempt_id = ?', whereArgs: ['a1']);
@@ -967,64 +906,14 @@ void main() {
     ]));
   });
 
-  test('v25 → v26 reconciles stored rungs into the active ladder [R2, R6]',
-      () async {
-    // Progression refactor: R0/R1 (tap/hum) become the warm-up and R7 is
-    // deferred, so any stored rung below R2 lifts to unison and any above R6
-    // drops to solo — in BOTH practice_phrases and progression_state.
-    final v25 = await databaseFactoryFfi.openDatabase(
-      path,
-      options: OpenDatabaseOptions(
-        version: 25,
-        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-        onCreate: (db, v) => AppDatabase.applyInitialSchema(db),
-      ),
-    );
-    Future<int> phrase(int rung) => v25.insert('practice_phrases', {
-          'phrase_text': 'w$rung',
-          'word_count': 1,
-          'syllable_count': 1,
-          'complexity_level': 1,
-          'current_rung': rung,
-        });
-    final atR0 = await phrase(0); // warm-up tap → lifts to unison
-    final atR1 = await phrase(1); // warm-up hum → lifts to unison
-    final atR4 = await phrase(4); // in range → untouched
-    final atR7 = await phrase(7); // deferred → drops to solo
-    await v25.insert('progression_state', {
-      'profile_id': AppDatabase.defaultProfileId,
-      'phrase_id': atR7,
-      'current_rung': 7, // deferred R7 in a progression record → drops to R6
-      'syllable_tier': 1,
-      'tempo_bpm': 60,
-    });
-    await v25.close();
-
-    final db = await databaseFactoryFfi.openDatabase(
-      path,
-      options: OpenDatabaseOptions(
-        version: 26,
-        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-        onUpgrade: AppDatabase.migrate,
-      ),
-    );
-    addTearDown(db.close);
-
-    Future<int> rungOf(int id) async => (await db.query('practice_phrases',
-            columns: ['current_rung'],
-            where: 'phrase_id = ?',
-            whereArgs: [id]))
-        .single['current_rung']! as int;
-    expect(await rungOf(atR0), 2); // R0 → unison
-    expect(await rungOf(atR1), 2); // R1 → unison
-    expect(await rungOf(atR4), 4); // in range, unchanged
-    expect(await rungOf(atR7), 6); // R7 → solo
-
-    final ps = (await db.query('progression_state',
-            where: 'phrase_id = ?', whereArgs: [atR7]))
-        .single;
-    expect(ps['current_rung'], 6); // progression record also clamped
-  });
+  // The v15 (legacy-rung reset) and v26 (clamp into the active ladder) tests
+  // were removed at v28. Both built "an old database" by stamping the CURRENT
+  // initial schema with an old version number — a trick that stopped working
+  // once practice_phrases.current_rung left the fresh-install schema. Both
+  // migrations still run for real installs that have the column, but what they
+  // guarded (a correct rung value) is no longer read by anything: a word has no
+  // resting rung. Rebuilding the full v14/v25 DDL by hand to keep testing a
+  // value nothing consumes would be weight, not safety.
 
   test('v1 → v27 adds is_starter and seeds the starter library (Part 3)',
       () async {
@@ -1072,5 +961,292 @@ void main() {
     expect(
         (await db.query('practice_phrases', where: 'is_starter = 1')).length,
         10);
+  });
+
+  // ---- v28: the MIT revert ------------------------------------------------
+  // The largest schema change since v1. The between-session support ladder is
+  // gone, so the per-word rung/tier/tempo record goes with it and the only thing
+  // progression carries forward is the PATIENT's level.
+
+  test('v27 → v28 adds mit_level, drops progression_state, keeps everything else',
+      () async {
+    // Build a genuine pre-v28 database by running the real migration path to 27
+    // (rather than stamping the current schema with an old number — that trick
+    // is what the removed v15/v26 tests died of).
+    // Create the file at v1, close it, then reopen at 27 so the real migration
+    // path actually runs (a first open at 27 would call onCreate and skip it).
+    final v1 = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 1,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onCreate: (db, v) => createV1Schema(db),
+      ),
+    );
+    await v1.close();
+    final old = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 27,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    await old.insert('user_profiles', {'profile_id': 'p1'});
+    final phraseId = await old.insert('practice_phrases', {
+      'phrase_text': 'Water',
+      'word_count': 1,
+      'syllable_count': 2,
+      'complexity_level': 1,
+      'current_rung': 6, // a rung that is about to stop meaning anything
+    });
+    await old.insert('practice_sessions',
+        {'session_id': 's1', 'profile_id': 'p1'});
+    await old.insert('exercise_attempts', {
+      'attempt_id': 'a1',
+      'session_id': 's1',
+      'phrase_id': phraseId,
+      'evaluation_label': 1,
+      'rung_at_attempt': 6,
+    });
+    await old.insert('progression_state', {
+      'profile_id': 'p1',
+      'phrase_id': phraseId,
+      'current_rung': 6,
+      'syllable_tier': 2,
+      'tempo_bpm': 50,
+    });
+    await old.close();
+
+    final db = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 28,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    addTearDown(db.close);
+
+    // The patient's level arrives, defaulting to II — MIT's core sequence.
+    final prof = (await db.query('user_profiles')).single;
+    expect(prof.containsKey('mit_level'), isTrue);
+    expect(prof['mit_level'], 1); // MitLevel.two
+
+    // The per-word progression record is gone outright.
+    final tables = await db.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='progression_state'");
+    expect(tables, isEmpty);
+
+    // Attempts gain a step column, NULL for rows produced under the ladder —
+    // their rung integers are NOT relabelled as steps, which would poison the
+    // very history the level criterion reads.
+    final attempt = (await db.query('exercise_attempts')).single;
+    expect(attempt.containsKey('step_at_attempt'), isTrue);
+    expect(attempt['step_at_attempt'], isNull);
+    expect(attempt['evaluation_label'], 1); // the real data is untouched
+
+    // Phrases keep their text/guide data.
+    final phrase = (await db.query('practice_phrases',
+            where: 'phrase_id = ?', whereArgs: [phraseId]))
+        .single;
+    expect(phrase['phrase_text'], 'Water');
+    expect(phrase['syllable_count'], 2);
+  });
+
+  test('v28 rebuilds tap_events onto step, keeping every logged tap', () async {
+    // The one table that is REBUILT rather than left alone: its rung column is
+    // NOT NULL, so it cannot simply stop being written.
+    // Create the file at v1, close it, then reopen at 27 so the real migration
+    // path actually runs (a first open at 27 would call onCreate and skip it).
+    final v1 = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 1,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onCreate: (db, v) => createV1Schema(db),
+      ),
+    );
+    await v1.close();
+    final old = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 27,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    await old.insert('user_profiles', {'profile_id': 'p1'});
+    final phraseId = await old.insert('practice_phrases', {
+      'phrase_text': 'Help',
+      'word_count': 1,
+      'syllable_count': 1,
+      'complexity_level': 1,
+    });
+    await old.insert('practice_sessions',
+        {'session_id': 's1', 'profile_id': 'p1'});
+    await old.insert('exercise_attempts', {
+      'attempt_id': 'a1',
+      'session_id': 's1',
+      'phrase_id': phraseId,
+      'evaluation_label': 1,
+    });
+    // A v1→v27 upgrade builds tap_events from the CURRENT creator, so it already
+    // carries `step`. Put the genuine old shape back, so the rebuild has real
+    // work to do.
+    await old.execute('DROP TABLE tap_events');
+    await old.execute('''
+      CREATE TABLE tap_events (
+        tap_id      TEXT PRIMARY KEY NOT NULL,
+        attempt_id  TEXT NOT NULL,
+        phrase_id   INTEGER NOT NULL,
+        session_id  TEXT NOT NULL,
+        rung        INTEGER NOT NULL,
+        tap_index   INTEGER NOT NULL,
+        down_ms     INTEGER NOT NULL,
+        dwell_ms    INTEGER,
+        beat_phase  REAL,
+        FOREIGN KEY (attempt_id) REFERENCES exercise_attempts(attempt_id) ON DELETE CASCADE,
+        FOREIGN KEY (phrase_id)  REFERENCES practice_phrases(phrase_id)
+      )
+    ''');
+    await old.insert('tap_events', {
+      'tap_id': 't1',
+      'attempt_id': 'a1',
+      'phrase_id': phraseId,
+      'session_id': 's1',
+      'rung': 6,
+      'tap_index': 0,
+      'down_ms': 100,
+      'dwell_ms': 55,
+      'beat_phase': 0.02,
+    });
+    await old.close();
+
+    final db = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 28,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    addTearDown(db.close);
+
+    final row = (await db.query('tap_events')).single;
+    // The tap itself is real data and survives…
+    expect(row['down_ms'], 100);
+    expect(row['dwell_ms'], 55);
+    expect(row['beat_phase'], 0.02);
+    // …but its ladder position does not decode to a step, so it is left NULL
+    // rather than guessed at.
+    expect(row.containsKey('step'), isTrue);
+    expect(row['step'], isNull);
+    expect(row.containsKey('rung'), isFalse);
+
+    // The cascade and the indexes survive the rebuild.
+    await db.delete('exercise_attempts',
+        where: 'attempt_id = ?', whereArgs: ['a1']);
+    expect(await db.query('tap_events'), isEmpty);
+    final indexes = (await db.rawQuery(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tap_events'"))
+        .map((r) => r['name'])
+        .toSet();
+    expect(indexes,
+        containsAll(['idx_tap_events_attempt', 'idx_tap_events_session']));
+  });
+
+  test('v29 tops up the graded phrase set without disturbing choices', () async {
+    // An install seeded before v29 had five active phrases, four of them ONE
+    // SYLLABLE — for a therapy built on a two-pitch contour, close to the worst
+    // possible starting set. The top-up is insert-only.
+    final v1 = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 1,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onCreate: (db, v) => createV1Schema(db),
+      ),
+    );
+    await v1.close();
+    final old = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 28,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    // A caregiver's own word, and one of the seeded phrases they switched ON.
+    await old.insert('practice_phrases', {
+      'phrase_text': 'Grandchildren',
+      'word_count': 1,
+      'syllable_count': 4,
+      'complexity_level': 2,
+      'is_active': 1,
+    });
+    await old.insert('practice_phrases', {
+      'phrase_text': 'Can you help me',
+      'word_count': 4,
+      'syllable_count': 4,
+      'complexity_level': 2,
+      'is_active': 1, // they turned it on; the seed ships it OFF
+    });
+    await old.close();
+
+    final db = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 31,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    addTearDown(db.close);
+
+    // The sentence-length phrases Level III needs now exist.
+    final long = await db.query('practice_phrases',
+        where: 'phrase_text = ?', whereArgs: ['I would like to go home now']);
+    expect(long, hasLength(1));
+    expect(long.single['complexity_level'], 3);
+
+    // Their own word is untouched…
+    final own = await db.query('practice_phrases',
+        where: 'phrase_text = ?', whereArgs: ['Grandchildren']);
+    expect(own.single['is_active'], 1);
+
+    // …and so is their choice to activate a seeded one. Matched on exact text,
+    // so it is neither duplicated nor reset to the shipped default.
+    final theirs = await db.query('practice_phrases',
+        where: 'phrase_text = ?', whereArgs: ['Can you help me']);
+    expect(theirs, hasLength(1), reason: 'not duplicated');
+    expect(theirs.single['is_active'], 1, reason: 'their choice stands');
+  });
+
+  test('v30 adds the caregiver practice goal, defaulting to an hour', () async {
+    final v1 = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 1,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onCreate: (db, v) => createV1Schema(db),
+      ),
+    );
+    await v1.insert('user_profiles', {'profile_id': 'p1'});
+    await v1.close();
+
+    final db = await databaseFactoryFfi.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: 31,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onUpgrade: AppDatabase.migrate,
+      ),
+    );
+    addTearDown(db.close);
+
+    final prof = (await db.query('user_profiles')).single;
+    expect(prof.containsKey('practice_target_minutes'), isTrue);
+    expect(prof['practice_target_minutes'], 60);
   });
 }

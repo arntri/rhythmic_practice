@@ -7,9 +7,8 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/models.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
-import 'package:rhythmic_practice/practice/mit_progression.dart';
 import 'package:rhythmic_practice/practice/practice_controller.dart';
-import 'package:rhythmic_practice/practice/progression.dart';
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 
 void main() {
   setUpAll(sqfliteFfiInit);
@@ -69,7 +68,7 @@ void main() {
       attemptId: attemptId,
       phraseId: phraseId,
       sessionId: sessionId,
-      rung: 4,
+      step: MitStep.immediateRepeat,
       taps: [
         TapEvent(downMs: 100, phase: 0.02, dwellMs: 55),
         TapEvent(downMs: 640, phase: 0.30, dwellMs: 80),
@@ -84,7 +83,7 @@ void main() {
     expect(taps[0].downMs, 100);
     expect(taps[0].dwellMs, 55);
     expect(taps[0].beatPhase, closeTo(0.02, 1e-9));
-    expect(taps[0].rung, 4);
+    expect(taps[0].step, MitStep.immediateRepeat);
     expect(taps[2].dwellMs, isNull);
 
     // The session read returns the same taps in chronological order.
@@ -117,7 +116,7 @@ void main() {
       attemptId: attemptId,
       phraseId: phraseId,
       sessionId: sessionId,
-      rung: 0,
+      step: MitStep.intoneUnison,
       taps: const [],
     );
     expect(await repo.getTapEvents(attemptId), isEmpty);
@@ -140,52 +139,21 @@ void main() {
     expect(cleared.probeQuestionClipPath, isNull);
   });
 
-  test('default progression tier is seeded from syllable count (item 12)',
-      () async {
-    final all = await repo.getAllPhrases();
-    // A single-syllable starter word → Level 1.
-    final short = all.firstWhere((p) => p.phraseText == 'Help');
-    final shortState =
-        await repo.getProgressionState(AppDatabase.defaultProfileId, short.phraseId);
-    expect(shortState.syllableTier, 1);
-    // The seeded 7-syllable phrase → Level 3 by default (no stored row yet).
-    final long = all.firstWhere((p) => p.syllableCount >= 7);
-    final longState =
-        await repo.getProgressionState(AppDatabase.defaultProfileId, long.phraseId);
-    expect(longState.syllableTier, 3);
-    // A seeded 4-syllable phrase → Level 2.
-    final mid = all.firstWhere((p) => p.syllableCount == 4);
-    final midState =
-        await repo.getProgressionState(AppDatabase.defaultProfileId, mid.phraseId);
-    expect(midState.syllableTier, 2);
-  });
-
-  test('recording a guide starts an un-practised word at unison (R2)', () async {
-    final phrase = (await repo.getActivePhrases()).first; // an un-practised word
-    // Every word now enters at unison regardless of level (progression refactor).
-    await repo.setGuideClip(phrase.phraseId, 'guides/g.enc', 5,
-        nucleiMs: const [100, 300, 500, 700, 900]);
-    final l2 = (await repo.getAllPhrases())
-        .firstWhere((p) => p.phraseId == phrase.phraseId);
-    expect(l2.rung, Rung.r2);
-  });
-
-  test('re-recording a PROGRESSED word never resets its rung (item 13)',
-      () async {
+  test('recording a guide no longer touches progression', () async {
+    // Under the ladder, confirming a guide seeded the word's entry rung from its
+    // syllable count — and had to be careful not to reset a word already
+    // climbing. There is no resting rung to seed or protect now: every item runs
+    // the patient's level sequence in full, so this write is purely about the
+    // clip, the syllable count and the contour.
     final phrase = (await repo.getActivePhrases()).first;
-    // The word has been practised: a progression_state row exists at R6.
-    await repo.upsertProgressionState(ProgressionState(
-      profileId: AppDatabase.defaultProfileId,
-      phraseId: phrase.phraseId,
-      rung: Rung.r6,
-    ));
-    await repo.setRung(phrase.phraseId, Rung.r6);
-    // Re-recording a (now Level-2) guide must NOT drag it back to the entry rung.
-    await repo.setGuideClip(phrase.phraseId, 'guides/g2.enc', 5,
-        nucleiMs: const [100, 300, 500, 700, 900]);
+    await repo.setGuideClip(phrase.phraseId, 'guides/g.enc', 5,
+        nucleiMs: const [100, 300, 500, 700, 900], stressIndex: 2);
     final after = (await repo.getAllPhrases())
         .firstWhere((p) => p.phraseId == phrase.phraseId);
-    expect(after.rung, Rung.r6); // progress preserved
+    expect(after.guideClipPath, 'guides/g.enc');
+    expect(after.syllableCount, 5);
+    expect(after.guideNucleiMs, const [100, 300, 500, 700, 900]);
+    expect(after.stressIndex, 2);
   });
 
   test('setSprechgesangClip round-trips (item 15) and null clears it', () async {
@@ -206,8 +174,10 @@ void main() {
 
   test('setGuideClip stores the caregiver-designated stress index (item A)',
       () async {
-    final phrase = (await repo.getActivePhrases()).first;
-    expect(phrase.stressIndex, isNull); // none until a contour is confirmed
+    // A phrase with no authored contour yet — the starter library ships its
+    // own stress indices, so pick one of the seeded phrases instead.
+    final phrase = (await repo.getAllPhrases())
+        .firstWhere((p) => !p.isStarter && p.stressIndex == null);
     await repo.setGuideClip(
       phrase.phraseId,
       'guides/clip.enc',
@@ -225,15 +195,6 @@ void main() {
     final again = (await repo.getAllPhrases())
         .firstWhere((p) => p.phraseId == phrase.phraseId);
     expect(again.stressIndex, 0);
-  });
-
-  test('setRung persists the progression rung; phrases default to unison', () async {
-    final phrase = (await repo.getActivePhrases()).first;
-    expect(phrase.rung, Rung.r2); // default unison
-    await repo.setRung(phrase.phraseId, Rung.r4);
-    final updated =
-        (await repo.getAllPhrases()).firstWhere((p) => p.phraseId == phrase.phraseId);
-    expect(updated.rung, Rung.r4);
   });
 
   test('daily summary rolls up today\'s attempts and tracks sync', () async {
@@ -279,63 +240,60 @@ void main() {
     expect((await repo.getProfile()).playbackSpeed, 0.5);
   });
 
-  test('comfort cap (session rung cap) defaults off, sets, and clears', () async {
-    // Off by default.
-    expect((await repo.getProfile()).sessionRungCap, isNull);
-
-    // Setting a cap round-trips.
-    await repo.updateProfile(sessionRungCap: Rung.r3.level);
-    expect((await repo.getProfile()).sessionRungCap, Rung.r3.level);
-
-    // The _unset default leaves it unchanged when other fields update.
-    await repo.updateProfile(metronomeBpm: 55);
-    expect((await repo.getProfile()).sessionRungCap, Rung.r3.level);
-
-    // Passing null explicitly clears the cap.
-    await repo.updateProfile(sessionRungCap: null);
-    expect((await repo.getProfile()).sessionRungCap, isNull);
-  });
-
-  test('progression state round-trips (default → upsert → read)', () async {
-    final phraseId = (await repo.getActivePhrases()).first.phraseId;
-    const profileId = AppDatabase.defaultProfileId;
-
-    // No row yet → sensible defaults.
-    var s = await repo.getProgressionState(profileId, phraseId);
-    expect(s.rung, Rung.r2);
-    expect(s.syllableTier, 1);
-    expect(s.bpm, MitProgression.defaultBpm);
-
-    await repo.upsertProgressionState(
-        s.copyWith(rung: Rung.r5, syllableTier: 2, bpm: 50));
-    s = await repo.getProgressionState(profileId, phraseId);
-    expect(s.rung, Rung.r5);
-    expect(s.syllableTier, 2);
-    expect(s.bpm, 50);
-  });
-
-  test('resetProgression sends every phrase back to unison and clears tier/tempo',
+  test('the MIT level defaults to II, round-trips, and survives other writes',
       () async {
-    const profileId = AppDatabase.defaultProfileId;
-    final phrases = await repo.getAllPhrases();
-    final phraseId = phrases.first.phraseId;
+    // Level II is MIT's core sequence, so a fresh profile opens there.
+    expect((await repo.getProfile()).mitLevel, MitLevel.two);
 
-    // Advance a phrase up the ladder with a non-default tier/tempo.
-    await repo.setRung(phraseId, Rung.r6);
-    await repo.upsertProgressionState(
-        ProgressionState(profileId: profileId, phraseId: phraseId)
-            .copyWith(rung: Rung.r6, syllableTier: 3, bpm: 40));
+    await repo.updateProfile(mitLevel: MitLevel.one);
+    expect((await repo.getProfile()).mitLevel, MitLevel.one);
+
+    // Updating an unrelated field leaves the level alone.
+    await repo.updateProfile(metronomeBpm: 55);
+    expect((await repo.getProfile()).mitLevel, MitLevel.one);
+
+    await repo.updateProfile(mitLevel: MitLevel.three);
+    expect((await repo.getProfile()).mitLevel, MitLevel.three);
+  });
+
+  test('the practice goal defaults to an hour a day and round-trips', () async {
+    // Minutes a day — the shape of what the research protocols asked for, and
+    // stated on screen rather than implied. See PracticeDose.
+    expect((await repo.getProfile()).practiceTargetMinutes, 60);
+    await repo.updateProfile(practiceTargetMinutes: 30);
+    expect((await repo.getProfile()).practiceTargetMinutes, 30);
+    // An unrelated write leaves it alone.
+    await repo.updateProfile(metronomeBpm: 55);
+    expect((await repo.getProfile()).practiceTargetMinutes, 30);
+  });
+
+  test('a session records how long it ran, from its attempts', () async {
+    // Practice dose is measured in minutes, and sessions used to record only
+    // when they STARTED — there was no way to know how long one lasted.
+    const profileId = AppDatabase.defaultProfileId;
+    final phraseId = (await repo.getActivePhrases()).first.phraseId;
+    final sid = await repo.createSession(profileId);
+
+    // Before any attempt, the session has no end and contributes nothing:
+    // opening the app is not practice.
+    expect(await repo.minutesPerDay(profileId), isEmpty);
+
+    await repo.insertAttempt(
+        sessionId: sid, phraseId: phraseId, evaluationLabel: 1);
+    final minutes = await repo.minutesPerDay(profileId);
+    expect(minutes, isNotEmpty, reason: 'the session now has an end');
+    expect(minutes.values.first, greaterThanOrEqualTo(0));
+  });
+
+  test('resetProgression puts the patient back at Level I', () async {
+    const profileId = AppDatabase.defaultProfileId;
+    await repo.updateProfile(mitLevel: MitLevel.three);
 
     await repo.resetProgression(profileId);
 
-    // Every phrase row is back at the unison entry (R2 — tap/hum are the warm-up)…
-    for (final p in await repo.getAllPhrases()) {
-      expect(p.rung, Rung.r2, reason: 'phrase ${p.phraseId} reset to unison');
-    }
-    // …and the progression record is gone, so reads fall back to defaults.
-    final s = await repo.getProgressionState(profileId, phraseId);
-    expect(s.syllableTier, 1);
-    expect(s.bpm, MitProgression.defaultBpm);
+    // The level IS the progression now — there is no per-word rung, tier or
+    // tempo left to clear alongside it.
+    expect((await repo.getProfile()).mitLevel, MitLevel.one);
   });
 
   test('sessionPassRates: judged attempts only, per session, oldest→newest',
@@ -343,68 +301,76 @@ void main() {
     final phraseId = (await repo.getActivePhrases()).first.phraseId;
     const profileId = AppDatabase.defaultProfileId;
 
-    // Session 1: one Pass + one Fail at judged rungs = 0.5; an Unsure and a
-    // co-production (rung < 4) attempt are ignored.
+    // Session 1: one Pass + one Fail = 0.5. The Unsure is ignored — "we could
+    // not tell" is not evidence either way.
     final s1 = await repo.createSession(profileId);
     await repo.insertAttempt(
-        sessionId: s1, phraseId: phraseId, evaluationLabel: 1, rungAtAttempt: 5);
+        sessionId: s1,
+        phraseId: phraseId,
+        evaluationLabel: 1,
+        stepAtAttempt: MitStep.immediateRepeat.index);
     await repo.insertAttempt(
-        sessionId: s1, phraseId: phraseId, evaluationLabel: 0, rungAtAttempt: 5);
+        sessionId: s1,
+        phraseId: phraseId,
+        evaluationLabel: 0,
+        stepAtAttempt: MitStep.immediateRepeat.index);
     await repo.insertAttempt(
-        sessionId: s1, phraseId: phraseId, evaluationLabel: 2, rungAtAttempt: 5);
-    await repo.insertAttempt(
-        sessionId: s1, phraseId: phraseId, evaluationLabel: 1, rungAtAttempt: 1);
+        sessionId: s1,
+        phraseId: phraseId,
+        evaluationLabel: 2,
+        stepAtAttempt: MitStep.immediateRepeat.index);
 
-    // Session 2: two Passes at judged rungs = 1.0.
+    // Session 2: two Passes = 1.0.
     final s2 = await repo.createSession(profileId);
     await repo.insertAttempt(
-        sessionId: s2, phraseId: phraseId, evaluationLabel: 1, rungAtAttempt: 6);
+        sessionId: s2,
+        phraseId: phraseId,
+        evaluationLabel: 1,
+        stepAtAttempt: MitStep.probeQuestion.index);
     await repo.insertAttempt(
-        sessionId: s2, phraseId: phraseId, evaluationLabel: 1, rungAtAttempt: 4);
+        sessionId: s2,
+        phraseId: phraseId,
+        evaluationLabel: 1,
+        stepAtAttempt: MitStep.intoneUnison.index);
 
     final rates = await repo.sessionPassRates(profileId, phraseId: phraseId);
     expect(rates, [0.5, 1.0]);
   });
 
-  test('sessionPassRates: minRung (top-rung) and tier filters for the tier gate',
-      () async {
+  test('sessionPassRates: the step filter narrows to one MIT step', () async {
     final phraseId = (await repo.getActivePhrases()).first.phraseId;
     const profileId = AppDatabase.defaultProfileId;
 
-    // Session A: an R6 Pass at tier 1, and an R4 Pass (below the top rung).
+    // Session A: a Pass at the probe question, and a Fail at the unison step.
     final a = await repo.createSession(profileId);
     await repo.insertAttempt(
         sessionId: a,
         phraseId: phraseId,
         evaluationLabel: 1,
-        rungAtAttempt: 6,
-        tierAtAttempt: 1);
+        stepAtAttempt: MitStep.probeQuestion.index);
     await repo.insertAttempt(
         sessionId: a,
         phraseId: phraseId,
         evaluationLabel: 0,
-        rungAtAttempt: 4,
-        tierAtAttempt: 1);
+        stepAtAttempt: MitStep.intoneUnison.index);
 
-    // Session B: an R6 Pass at tier 2 (a later tier).
+    // Session B: a Pass at the probe question only.
     final b = await repo.createSession(profileId);
     await repo.insertAttempt(
         sessionId: b,
         phraseId: phraseId,
         evaluationLabel: 1,
-        rungAtAttempt: 6,
-        tierAtAttempt: 2);
+        stepAtAttempt: MitStep.probeQuestion.index);
 
-    // Top-rung only (minRung 6): the R4 attempt drops out → A is 1.0 (R6 pass).
-    final topRung = await repo.sessionPassRates(profileId,
-        phraseId: phraseId, minRung: 6);
-    expect(topRung, [1.0, 1.0]); // session A (R6) and session B (R6)
+    // Unfiltered, session A mixes both steps → 0.5.
+    expect(await repo.sessionPassRates(profileId, phraseId: phraseId),
+        [0.5, 1.0]);
 
-    // Scoped to tier 1: only session A's R6 attempt counts; session B (tier 2)
-    // is excluded — so old top-rung mastery can't re-trigger a later tier.
-    final tier1 = await repo.sessionPassRates(profileId,
-        phraseId: phraseId, minRung: 6, tier: 1);
-    expect(tier1, [1.0]); // just session A
+    // Narrowed to the probe question — which is how solo-mode eligibility is
+    // measured — the unison Fail drops out and both sessions read 1.0.
+    final probeOnly = await repo.sessionPassRates(profileId,
+        phraseId: phraseId, step: MitStep.probeQuestion);
+    expect(probeOnly, [1.0, 1.0]);
   });
 
   test('setPhoto attaches and clears a name-card photo', () async {

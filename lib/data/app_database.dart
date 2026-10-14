@@ -116,7 +116,26 @@ class AppDatabase {
   // v27 adds is_starter on practice_phrases (the starter word library, Part 3):
   // ~10 phrases bundled with placeholder guides, seeded idempotently. The flag is
   // presentation-only — it never branches practice logic (rungs/progression).
-  static const _schemaVersion = 27;
+  // v28 is the MIT revert (DEPRECATIONS.md §2): the between-session support
+  // ladder is replaced by MIT's within-item step sequence, so a word no longer
+  // sits at a rung and there is nothing per-word to carry between sessions.
+  // ADDS user_profiles.mit_level (the PATIENT's Level I/II/III — the only thing
+  // progression now carries forward) and exercise_attempts.step_at_attempt;
+  // DROPS the progression_state table; rebuilds tap_events with `step` in place
+  // of `rung`. The dead columns on practice_phrases/exercise_attempts/
+  // user_profiles are left behind on upgraded databases (SQLite DROP COLUMN
+  // needs 3.35+) but are gone from the fresh-install schema and read nowhere.
+  // v30 adds practice_target_minutes on user_profiles: the caregiver's goal in
+  // minutes a day, which the practice-dose view measures against. Default 60 —
+  // the shape of what the research protocols asked for.
+  // v31 adds ended_at on practice_sessions: when a session last saw activity.
+  // Practice dose is measured in minutes a day, and sessions previously recorded
+  // only when they started.
+  // v32 adds the home-screen plant: plant_stage (0-4, only ever increases) and
+  // plant_grown_on, the local day it last grew. It is the ONLY progress the
+  // patient ever sees, and it is a record of turning up rather than of doing
+  // well — so nothing can make it go backwards.
+  static const _schemaVersion = 32;
 
   // We hold onto the open connection once we've opened it.
   Database? _db;
@@ -370,6 +389,76 @@ class AppDatabase {
           'is_starter INTEGER CHECK(is_starter IN (0,1)) DEFAULT 0');
       await _seedStarters(db);
     }
+    if (oldVersion < 28 && newVersion >= 28) {
+      // The MIT revert. The between-session support ladder is gone: an item no
+      // longer *sits* at a rung, so there is nothing per-word to store and
+      // nothing to raise or lower. See DEPRECATIONS.md §2.
+      //
+      // (a) The patient's MIT level (0 = I, 1 = II, 2 = III) — the level belongs
+      //     to the PERSON, and it is now the only thing progression carries
+      //     between sessions. Default II, MIT's core sequence.
+      await _addColumnIfMissing(db, 'user_profiles', 'mit_level',
+          'mit_level INTEGER NOT NULL DEFAULT 1 CHECK(mit_level IN (0,1,2))');
+      // (b) The MIT step an attempt was produced at. A NEW column rather than a
+      //     reinterpretation of `rung_at_attempt`: the old integers meant rungs
+      //     on a ladder that no longer exists, and quietly relabelling them as
+      //     steps would poison the very history the level criterion reads.
+      //     Old rows keep their (now meaningless) rung and get a NULL step.
+      await _addColumnIfMissing(db, 'exercise_attempts', 'step_at_attempt',
+          'step_at_attempt INTEGER');
+      // (c) progression_state held the per-(profile, phrase) rung + syllable
+      //     tier + per-word tempo. All three concepts are gone, so the table
+      //     goes with them rather than lingering as dead weight.
+      await db.execute('DROP TABLE IF EXISTS progression_state');
+      // (d) tap_events.rung → step. This one IS rebuilt rather than left: the
+      //     column is NOT NULL, so it cannot simply stop being written, and the
+      //     table is a young append-only log where a rebuild is cheap. Existing
+      //     rows are preserved with a NULL step — their taps are still real, it
+      //     is only the ladder position that has stopped meaning anything.
+      await _rebuildTapEventsForSteps(db);
+      // The dead COLUMNS (practice_phrases.current_rung, exercise_attempts
+      // .rung_at_attempt / .tier_at_attempt, user_profiles.session_rung_cap) are
+      // left in place on upgraded databases: SQLite only learned DROP COLUMN in
+      // 3.35 and Android ships whatever it ships, so rebuilding two tables to
+      // reclaim four unread columns is a worse trade than leaving them. Fresh
+      // installs never get them — they are gone from [_createSchema].
+    }
+    if (oldVersion < 29 && newVersion >= 29) {
+      // The graded practice set (DEPRECATIONS.md §5). An install seeded before
+      // this had five active phrases, four of them ONE SYLLABLE — which for a
+      // therapy built on a two-pitch contour is close to the worst possible
+      // starting set. Top up the missing phrases so the longer items Level III
+      // needs actually exist. Insert-only and matched on exact text, so nothing
+      // a caregiver has chosen is disturbed and re-running it is a no-op.
+      await _seedPhrases(db);
+    }
+    if (oldVersion < 30 && newVersion >= 30) {
+      // The caregiver's practice goal, in MINUTES A DAY. MIT is an intensive
+      // therapy — the trials ran long daily sessions for months — so the target
+      // is stated rather than hidden behind a bar that happens to look full, and
+      // it is adjustable, because a target nobody can reach is not a target.
+      await _addColumnIfMissing(db, 'user_profiles', 'practice_target_minutes',
+          'practice_target_minutes INTEGER NOT NULL DEFAULT 60');
+    }
+    if (oldVersion < 31 && newVersion >= 31) {
+      // When a session last saw activity. Practice dose is measured in MINUTES
+      // per day, and there was no way to know how long a session ran: sessions
+      // recorded only when they started. Stamped on every attempt save, so the
+      // span covers the warm-up and the last production rather than stopping at
+      // the second-to-last attempt the way a max-of-timestamps would.
+      await _addColumnIfMissing(
+          db, 'practice_sessions', 'ended_at', 'ended_at TEXT');
+    }
+    if (oldVersion < 32 && newVersion >= 32) {
+      // The home-screen plant. It grows once for each DAY practice happens, it
+      // is cumulative, and it never goes backwards — so the only state needed is
+      // how grown it is and the last day it grew, to stop a second session the
+      // same afternoon counting twice.
+      await _addColumnIfMissing(db, 'user_profiles', 'plant_stage',
+          'plant_stage INTEGER NOT NULL DEFAULT 0');
+      await _addColumnIfMissing(
+          db, 'user_profiles', 'plant_grown_on', 'plant_grown_on TEXT');
+    }
   }
 
   /// `ALTER TABLE … ADD COLUMN` only when [column] isn't already on [table].
@@ -392,7 +481,11 @@ class AppDatabase {
   static Future<void> applyInitialSchema(Database db) async {
     await _createSchema(db);
     await _seed(db);
+    // Starters BEFORE the rest: [_seedPhrases] skips any text already present,
+    // so seeding the clip-backed set first makes the two lists impossible to
+    // duplicate even if they ever come to overlap.
     await _seedStarters(db);
+    await _seedPhrases(db);
   }
 
   static Future<void> _createSchema(Database db) async {
@@ -415,8 +508,11 @@ class AppDatabase {
         onboarding_seen          INTEGER CHECK(onboarding_seen IN (0,1)) DEFAULT 0,  -- first-run instructions shown
         target_display           TEXT CHECK(target_display IN ('picture','word','both')) DEFAULT 'picture',  -- how the word is shown
         playback_speed           REAL NOT NULL DEFAULT 1.0,  -- caregiver guide-speed multiplier (lower = slower)
-        session_rung_cap         INTEGER,  -- caregiver comfort cap: max rung the auto-progression may reach (NULL = no cap)
-        demo_mode_enabled        INTEGER CHECK(demo_mode_enabled IN (0,1)) DEFAULT 0,  -- presenter in-session level picker on/off
+        mit_level                INTEGER NOT NULL DEFAULT 1 CHECK(mit_level IN (0,1,2)),
+        practice_target_minutes  INTEGER NOT NULL DEFAULT 60,  -- v30: caregiver's goal, minutes a day
+        plant_stage              INTEGER NOT NULL DEFAULT 0,   -- v32: home-screen plant, 0-4, only ever grows
+        plant_grown_on           TEXT,                          -- v32: the day it last grew ('YYYY-MM-DD', local)
+        demo_mode_enabled        INTEGER CHECK(demo_mode_enabled IN (0,1)) DEFAULT 0,  -- presenter in-session step picker on/off
         solo_mode_enabled        INTEGER CHECK(solo_mode_enabled IN (0,1)) DEFAULT 0  -- scoped solo practice on/off (item 19, scaffold; advisory-only)
       )
     ''');
@@ -431,7 +527,6 @@ class AppDatabase {
         audio_asset_path TEXT,                    -- bundled fallback clip (rarely used)
         guide_clip_path  TEXT,                    -- AES-encrypted recorded guide = DTW reference
         guide_nuclei_ms  TEXT,                    -- CSV of confirmed syllable-nucleus timestamps (ms)
-        current_rung     INTEGER NOT NULL DEFAULT 2,  -- MIT support/task ladder rung (0-7)
         photo_path       TEXT,                     -- AES-encrypted photo for name cards (§6)
         probe_question_text       TEXT,           -- v21: the R7 probe question the user answers with the phrase
         probe_question_clip_path  TEXT,           -- v21: AES-encrypted recorded probe question (TTS fallback on the text)
@@ -447,6 +542,7 @@ class AppDatabase {
         session_id  TEXT PRIMARY KEY NOT NULL,
         profile_id  TEXT NOT NULL,
         started_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+        ended_at    TEXT,                       -- v31: last activity, for practice-dose minutes
         synced_at   TEXT,                       -- cloud-sync: when pushed to Supabase (NULL = pending)
         FOREIGN KEY (profile_id) REFERENCES user_profiles(profile_id) ON DELETE CASCADE
       )
@@ -465,8 +561,7 @@ class AppDatabase {
         local_encrypted_audio_path    TEXT DEFAULT NULL,
         synced_at                     TEXT,     -- cloud-sync: when pushed to Supabase (NULL = pending)
         support_level                 INTEGER NOT NULL DEFAULT 2 CHECK(support_level IN (1,2,3,4)),
-        rung_at_attempt               INTEGER,  -- Phase 3: MIT rung (0-6) this attempt was produced at (NULL pre-v8)
-        tier_at_attempt               INTEGER,  -- Phase 3: syllable tier this attempt was produced at (NULL pre-v16)
+        step_at_attempt               INTEGER,  -- v28: the MIT step (MitStep index) this production was made at (NULL pre-v28)
         tempo_bpm                     INTEGER,  -- v20: metronome tempo at capture (beat reference for onset-vs-beat; NULL pre-v20)
         FOREIGN KEY (session_id) REFERENCES practice_sessions(session_id) ON DELETE CASCADE,
         FOREIGN KEY (phrase_id)  REFERENCES practice_phrases(phrase_id)
@@ -474,7 +569,6 @@ class AppDatabase {
     ''');
 
     await _createAnalysisTables(db);
-    await _createProgressionTable(db);
     await _createDailySummaryTable(db);
     await _createTapEventsTable(db);
     await _createDailySummaryReadIndexes(db);
@@ -511,7 +605,7 @@ class AppDatabase {
         attempt_id  TEXT NOT NULL,
         phrase_id   INTEGER NOT NULL,
         session_id  TEXT NOT NULL,
-        rung        INTEGER NOT NULL,   -- MIT rung (0-6) the tap was produced at
+        step        INTEGER,            -- v28: the MIT step (MitStep index) the tap was produced at; NULL for rows migrated from the old rung ladder
         tap_index   INTEGER NOT NULL,   -- 0-based order within the attempt
         down_ms     INTEGER NOT NULL,   -- monotonic touch-down time (ms since session start)
         dwell_ms    INTEGER,            -- press duration (touch-down→up); NULL if no release seen
@@ -524,6 +618,35 @@ class AppDatabase {
         'CREATE INDEX idx_tap_events_attempt ON tap_events(attempt_id)');
     await db.execute(
         'CREATE INDEX idx_tap_events_session ON tap_events(session_id)');
+  }
+
+  /// v28: replace `tap_events.rung` with `tap_events.step`, keeping every tap.
+  ///
+  /// The standard SQLite column-rename dance (build the new table, copy, drop,
+  /// rename) rather than `ALTER TABLE … RENAME COLUMN`, because the column also
+  /// changes meaning and nullability: the old value was a rung on a ladder that
+  /// no longer exists, so migrated rows get a NULL step instead of a number that
+  /// would read as a step and be wrong. A no-op if the table is already migrated.
+  static Future<void> _rebuildTapEventsForSteps(Database db) async {
+    final tables = await db.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tap_events'");
+    if (tables.isEmpty) return;
+    final cols = await db.rawQuery('PRAGMA table_info(tap_events)');
+    if (cols.any((c) => c['name'] == 'step')) return;
+
+    await db.execute('DROP INDEX IF EXISTS idx_tap_events_attempt');
+    await db.execute('DROP INDEX IF EXISTS idx_tap_events_session');
+    await db.execute('ALTER TABLE tap_events RENAME TO tap_events_old');
+    await _createTapEventsTable(db);
+    await db.execute('''
+      INSERT INTO tap_events
+        (tap_id, attempt_id, phrase_id, session_id, step, tap_index, down_ms,
+         dwell_ms, beat_phase)
+      SELECT tap_id, attempt_id, phrase_id, session_id, NULL, tap_index, down_ms,
+             dwell_ms, beat_phase
+      FROM tap_events_old
+    ''');
+    await db.execute('DROP TABLE tap_events_old');
   }
 
   /// Per-(profile, day) metrics rollup: attempt counts, the Pass/Fail/Unsure
@@ -619,50 +742,78 @@ class AppDatabase {
     // Create the one local profile. The schema fills in every other column with
     // its default (60 BPM, all channels on, consent = false, etc.).
     await db.insert('user_profiles', {'profile_id': defaultProfileId});
+  }
 
-    // Starter phrases. Each tuple is:
-    //   [text, word_count, syllable_count, is_active]
-    // complexity_level is DERIVED from syllable_count (audit item 12,
-    // levelForSyllableCount: 1–3→L1, 4–6→L2, 7+→L3) rather than hand-assigned, so
-    // a phrase's level always matches its real syllable count. Most starter words
-    // are short (L1); two longer phrases seed L2/L3 examples. is_active is explicit
-    // (a small single-syllable starter set is on) — it's no longer tied to level,
-    // since under the syllable-count mapping nearly every short word is L1.
-    const seedPhrases = <List<Object>>[
-      // Single-syllable core words (active by default → a short first session).
-      ['Help', 1, 1, 1],
-      ['Pain', 1, 1, 1],
-      ['More', 1, 1, 1],
-      ['Stop', 1, 1, 1],
-      ['Water', 1, 2, 1],
-      // Short words (L1), off by default — the caregiver enables them as ready.
-      ['Bathroom', 1, 2, 0],
-      ['Hungry', 1, 2, 0],
-      ['Medicine', 1, 3, 0],
-      ['Sleepy', 1, 2, 0],
-      ['Thank you', 2, 2, 0],
-      ['I want food', 3, 3, 0],
-      ['Sit down', 2, 2, 0],
-      ['I love you', 3, 3, 0],
-      // Longer phrases so L2 / L3 exist out of the box (off by default).
-      ['Can you help me', 4, 4, 0], // 4 syllables → L2
-      ['I would like to go home now', 7, 7, 0], // 7 syllables → L3
-    ];
+  /// The phrases seeded here — the ones the starter library does **not** ship.
+  ///
+  /// Each tuple is `[text, word_count, syllable_count, is_active]`.
+  ///
+  /// The two sets are deliberately disjoint. The **starter library** owns the
+  /// short functional phrases, because those are the ones that ship with a
+  /// bundled guide clip. This list owns what has no clip yet: the longer items,
+  /// and the bare single words. (They are not left out — with no recorded guide
+  /// the app falls back to the built-in voice, so they run; they just don't
+  /// sound as good until the real clips are authored.)
+  ///
+  /// **Graded by length, and nothing here is on by default.**
+  ///
+  /// The medium phrases and sentences exist because **Level III had nothing
+  /// appropriate to practise**: its delayed repeat and Sprechgesang steps are for
+  /// established, sentence-length material, and every phrase in the app was three
+  /// syllables or fewer.
+  ///
+  /// The single words are here because a caregiver may genuinely want "Stop" or
+  /// "Help" available. They are off, and deliberately so: MIT intones a phrase on
+  /// two pitches a minor third apart, one syllable per beat, so a **one-syllable
+  /// target has no contour** — its hum is a single note and the method's melodic
+  /// half barely engages. The seed used to open with four of them active, which
+  /// is close to the worst possible starting set for this therapy.
+  static const List<List<Object>> seedPhrases = <List<Object>>[
+    // --- Medium phrases, 4-6 syllables.
+    ['Can you help me', 4, 4, 0],
+    ['I want some water', 4, 5, 0],
+    ['I need the bathroom', 4, 5, 0],
+    ['How are you today', 4, 5, 0],
+    ['I would like to eat', 5, 5, 0],
+    ['Please turn on the light', 5, 5, 0],
+    // --- Sentences, 7+ syllables. What Level III is for.
+    ['I would like to go home now', 7, 7, 0],
+    ['Can you please come and help me', 7, 8, 0],
+    ['I am feeling much better today', 6, 9, 0],
+    // --- Single words: no contour to intone (see above).
+    ['Help', 1, 1, 0],
+    ['Stop', 1, 1, 0],
+    ['More', 1, 1, 0],
+    ['Pain', 1, 1, 0],
+  ];
 
-    // A batch sends all inserts in one trip for speed. Only the single-syllable
-    // starter words are active by default, so a first session is short and
-    // intentional (~5 words); the caregiver enables more from settings.
+  /// Insert any of [seedPhrases] that aren't already present, by exact text.
+  ///
+  /// Idempotent, and **never touches an existing row** — so the v29 top-up can
+  /// give an existing install the longer phrases it was missing without undoing
+  /// a caregiver's own choices about what is active.
+  static Future<void> _seedPhrases(Database db) async {
+    final existing = {
+      for (final r in await db.query('practice_phrases', columns: ['phrase_text']))
+        r['phrase_text'] as String,
+    };
     final batch = db.batch();
     for (final row in seedPhrases) {
+      final text = row[0] as String;
+      if (existing.contains(text)) continue;
       final syllables = row[2] as int;
-      // Mirror levelForSyllableCount (kept inline to avoid a data→practice import).
+      // Length band, kept inline to avoid a data→practice import: 1-3 short,
+      // 4-6 medium, 7+ a sentence. A descriptor, not a therapy level — the
+      // patient's MIT level is on the profile.
       final level = syllables <= 3 ? 1 : (syllables <= 6 ? 2 : 3);
+      // Only columns guaranteed on both fresh AND upgraded schemas — this also
+      // runs from the v29 migration, where audio_asset_path (a fresh-install-only
+      // column) does not exist. It is a legacy column nothing reads anyway.
       batch.insert('practice_phrases', {
-        'phrase_text': row[0],
+        'phrase_text': text,
         'word_count': row[1],
         'syllable_count': syllables,
         'complexity_level': level,
-        'audio_asset_path': null, // filled in when we add the audio guide
         'is_active': row[3],
       });
     }

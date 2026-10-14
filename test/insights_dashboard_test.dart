@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
 import 'package:rhythmic_practice/ml/insights_dashboard.dart';
@@ -34,13 +35,13 @@ void main() {
         sessionId: sessionId,
         phraseId: phraseId,
         evaluationLabel: 1,
-        rungAtAttempt: 4,
+        stepAtAttempt: MitStep.probeQuestion.index,
       );
       await repo.insertTapEvents(
         attemptId: attemptId,
         phraseId: phraseId,
         sessionId: sessionId,
-        rung: 4,
+        step: MitStep.probeQuestion,
         taps: [
           for (var i = 0; i < 5; i++)
             TapEvent(downMs: a * 5000 + i * 500, phase: 0.0, dwellMs: 90),

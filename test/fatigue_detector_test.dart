@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 import 'package:rhythmic_practice/data/models.dart';
 import 'package:rhythmic_practice/ml/fatigue_detector.dart';
 
@@ -18,7 +19,7 @@ List<StoredTapEvent> _attemptTaps(
       attemptId: attemptId,
       phraseId: 1,
       sessionId: 's1',
-      rung: 4,
+      step: MitStep.immediateRepeat,
       tapIndex: i,
       downMs: t,
       dwellMs: dwell,
@@ -84,7 +85,11 @@ void main() {
     final taps = <StoredTapEvent>[
       StoredTapEvent(
           tapId: 't', attemptId: 'a1', phraseId: 1, sessionId: 's1',
-          rung: 6, tapIndex: 0, downMs: 0, dwellMs: null, beatPhase: null),
+          step: MitStep.probeQuestion,
+          tapIndex: 0,
+          downMs: 0,
+          dwellMs: null,
+          beatPhase: null),
     ];
     final onsets = <List<int>>[
       [0, 400, 800, 1200], // steady
@@ -126,7 +131,7 @@ StoredTapEvent _withDwell(StoredTapEvent t, int dwell) => StoredTapEvent(
       attemptId: t.attemptId,
       phraseId: t.phraseId,
       sessionId: t.sessionId,
-      rung: t.rung,
+      step: t.step,
       tapIndex: t.tapIndex,
       downMs: t.downMs,
       dwellMs: dwell,

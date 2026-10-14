@@ -20,6 +20,9 @@ Future<void> main() async {
   // pages flip to portrait on push via [OrientationRouteObserver]; see
   // app/orientation.dart.
   await SystemChrome.setPreferredOrientations(kLandscapeOrientations);
+  // Full screen from the first frame, so the bars are never briefly in the way
+  // on launch. Re-applied on every route change by [OrientationRouteObserver].
+  applyFullScreen();
 
   // Connect to Supabase if credentials are configured. This never throws — if
   // the cloud is absent or unreachable the app still runs fully locally.

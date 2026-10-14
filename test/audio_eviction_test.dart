@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
 import 'package:rhythmic_practice/practice/practice_controller.dart';
@@ -213,7 +214,7 @@ void main() {
       attemptId: 'derived',
       phraseId: phraseId,
       sessionId: sessionId,
-      rung: 4,
+      step: MitStep.immediateRepeat,
       taps: [
         TapEvent(downMs: 100, phase: 0.0, dwellMs: 80),
         TapEvent(downMs: 620, phase: 0.3, dwellMs: 75),

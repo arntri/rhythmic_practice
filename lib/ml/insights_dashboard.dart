@@ -1,6 +1,5 @@
 import '../data/models.dart';
 import '../data/practice_repository.dart';
-import '../practice/progression.dart';
 import 'fatigue_detector.dart';
 import 'graduation_gate.dart';
 import 'solo_mode.dart';
@@ -57,14 +56,13 @@ class InsightsService {
 
     // Scoped solo readiness: which mastered words currently qualify.
     final phrases = await _repo.getActivePhrases();
-    final rungLevel = <int, int>{};
     final passRate = <int, double>{};
     final sessionCount = <int, int>{};
     for (final p in phrases) {
-      final state = await _repo.getProgressionState(profileId, p.phraseId);
-      rungLevel[p.phraseId] = state.rung.level;
+      // Mastery is read at MIT's most independent step, not from a stored rung —
+      // a word has no resting rung to inspect any more.
       final rates = await _repo.sessionPassRates(profileId,
-          phraseId: p.phraseId, minRung: topRung.level);
+          phraseId: p.phraseId, step: SoloScope.soloStep);
       if (rates.isNotEmpty) {
         passRate[p.phraseId] =
             rates.reduce((a, b) => a + b) / rates.length;
@@ -72,7 +70,6 @@ class InsightsService {
       }
     }
     final eligible = _scope.eligiblePhrases(
-      rungLevelByPhrase: rungLevel,
       recentPassRateByPhrase: passRate,
       recentSessionsByPhrase: sessionCount,
     );

@@ -1,3 +1,5 @@
+import '../practice/mit_sequence.dart';
+
 /// **Scoped solo mode** (audit item 19) — scaffold.
 ///
 /// The long-term idea: once a word is genuinely mastered, the patient could
@@ -5,8 +7,9 @@
 /// with the app giving light feedback. Two things make that safe, and both are
 /// enforced here:
 ///
-///  1. **Scope by mastery.** Only words that are already at the top of the ladder
-///     with a strong recent pass rate are eligible ([eligiblePhrases]). A word
+///  1. **Scope by mastery.** Only words the person already carries at MIT's most
+///     independent step — answering a question with the phrase, no model — with
+///     a strong recent pass rate there, are eligible ([eligiblePhrases]). A word
 ///     still being learned always keeps the caregiver in the loop.
 ///  2. **Scope by authority.** Even for eligible words, solo mode may only *stand
 ///     in* for the caregiver once Layer C has graduated ([authorityFor]). Until
@@ -18,40 +21,42 @@
 /// the engine + the `solo_mode_enabled` profile flag are the wired scaffold.
 class SoloScope {
   const SoloScope({
-    this.minRungLevel = 6,
     this.minRecentPassRate = 0.8,
     this.minRecentSessions = 3,
   });
 
-  /// Minimum rung level (0–7) a word must be at to be solo-eligible — solo means
-  /// no model and no per-rep caregiver check, so only the solo rungs qualify.
-  final int minRungLevel;
+  /// The MIT step mastery is measured at. Solo practice means no model and no
+  /// per-production caregiver check, so the only fair evidence for it is the
+  /// step that already asks for the phrase unaided: the probe question.
+  ///
+  /// This replaced a `minRungLevel` threshold. Under the ladder a word *sat* at
+  /// a rung, so "is it at R6 or above" was a question you could ask of the word;
+  /// with the sequence run in full every session there is no resting rung to
+  /// compare, and the honest question is how the person does at the hardest step
+  /// when they get there.
+  static const MitStep soloStep = MitStep.probeQuestion;
 
-  /// Minimum recent pass rate (at the top rung) for eligibility.
+  /// Minimum recent pass rate at [soloStep] for eligibility.
   final double minRecentPassRate;
 
   /// Minimum recent judged sessions that pass rate must be based on — so a word
   /// isn't declared "mastered" off one lucky session.
   final int minRecentSessions;
 
-  /// The active phrases mastered enough to practise solo. A phrase qualifies when
-  /// it is at/above [minRungLevel] AND its recent top-rung pass rate is
-  /// ≥ [minRecentPassRate] over at least [minRecentSessions] sessions.
+  /// The active phrases mastered enough to practise solo: those whose recent
+  /// pass rate at [soloStep] is ≥ [minRecentPassRate] over at least
+  /// [minRecentSessions] sessions. A phrase with no history at that step has
+  /// never been asked to stand on its own, so it never qualifies.
   Set<int> eligiblePhrases({
-    required Map<int, int> rungLevelByPhrase,
     required Map<int, double> recentPassRateByPhrase,
     required Map<int, int> recentSessionsByPhrase,
   }) {
     final out = <int>{};
-    for (final entry in rungLevelByPhrase.entries) {
+    for (final entry in recentPassRateByPhrase.entries) {
       final id = entry.key;
-      final rung = entry.value;
-      final rate = recentPassRateByPhrase[id];
+      final rate = entry.value;
       final sessions = recentSessionsByPhrase[id] ?? 0;
-      if (rung >= minRungLevel &&
-          rate != null &&
-          rate >= minRecentPassRate &&
-          sessions >= minRecentSessions) {
+      if (rate >= minRecentPassRate && sessions >= minRecentSessions) {
         out.add(id);
       }
     }

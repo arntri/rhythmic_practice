@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:rhythmic_practice/data/app_database.dart';
+import 'package:rhythmic_practice/data/starter_library.dart';
 
 void main() {
   setUpAll(sqfliteFfiInit);
@@ -28,21 +29,35 @@ void main() {
     expect(profiles.first['profile_id'], AppDatabase.defaultProfileId);
     expect(profiles.first['metronome_bpm'], 60);
 
-    // 15 generic seed phrases (is_starter = 0) + the 10-word starter library
-    // (is_starter = 1, Part 3) = 25 rows.
+    // The clip-backed starter library (is_starter = 1) plus the seeded phrases
+    // it doesn't ship (is_starter = 0). The two lists are disjoint by design —
+    // both insert into this table, so an overlap would be a duplicate phrase in
+    // the caregiver's library.
     final phrases = await db.query('practice_phrases');
-    expect(phrases.length, 25);
+    expect(phrases.length, starterLibrary.length + AppDatabase.seedPhrases.length);
     final generic =
         await db.query('practice_phrases', where: 'is_starter = 0');
-    expect(generic.length, 15);
+    expect(generic.length, AppDatabase.seedPhrases.length);
     final starters =
         await db.query('practice_phrases', where: 'is_starter = 1');
-    expect(starters.length, 10);
+    expect(starters.length, starterLibrary.length);
 
-    // 5 single-syllable generic words start active + 4 starter essentials
-    // (Water/Hello/Yes/No) = 9, so a first session is short and intentional.
+    // A first session is short and intentional, and — the thing that matters —
+    // every phrase in it has a MELODIC CONTOUR to intone. The seed used to open
+    // on four one-syllable words, whose hum is a single note; nothing
+    // one-syllable is active now, from either list.
     final active = await db.query('practice_phrases', where: 'is_active = 1');
-    expect(active.length, 9);
+    expect(active, isNotEmpty);
+    expect(
+      active.every((r) => (r['syllable_count'] as int) >= 2),
+      isTrue,
+      reason: 'a one-syllable target has no contour to intone',
+    );
+    expect(
+      active.length,
+      starterLibrary.where((s) => s.activeByDefault).length +
+          AppDatabase.seedPhrases.where((r) => r[3] == 1).length,
+    );
 
     // complexity_level is derived from syllable_count (item 12): the seeded
     // longer phrases are L2 (4–6 syllables) and L3 (7+).

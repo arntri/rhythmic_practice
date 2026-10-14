@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../app/orientation.dart';
 import '../theme.dart';
+import 'tapping_tutorial_screen.dart';
 
 /// Caregiver instructions — shown automatically on first run (onboarding) and
 /// reopenable any time from the home screen's ⓘ button (UX overhaul). Covers
@@ -40,16 +42,17 @@ class HelpScreen extends StatelessWidget {
                     'First, tap along to the beat once to settle into the rhythm.',
                     'For each word you’ll see the word (or a photo), and usually '
                         'hear a slow spoken model to say along with or after.',
-                    'Words come one at a time. Each word has its own level, so '
-                        'what it asks of you changes as it gets easier.',
+                    'Words come one at a time, following the step sequence for '
+                        'the current MIT level (I, II, or III) — one setting for '
+                        'the whole person, not per word.',
                   ]),
                   _section(context, '2 · The caregiver’s part', [
                     'After each attempt, tap a verdict on the right-hand bar: '
-                        'Accept, Unsure, or Not yet.',
+                        'Yes, Maybe, or Not yet.',
                     'Nothing moves on until you tap one — take your time.',
-                    'Words climb to a harder level after a few Accepts, and ease '
-                        'back after repeated “Not yet”. You can also set the level '
-                        'by hand in caregiver settings.',
+                    'After enough strong sessions the app will suggest moving up '
+                        'a level — you can accept or decline. You can also set '
+                        'the level by hand in caregiver settings.',
                   ]),
                   _section(context, '3 · While recording', [
                     'On the higher levels the microphone records the attempt — a '
@@ -68,6 +71,26 @@ class HelpScreen extends StatelessWidget {
                         'not failure.',
                   ]),
                   const SizedBox(height: 16),
+                  // The one thing in this app a caregiver has to be TAUGHT
+                  // rather than shown. It's offered here rather than buried,
+                  // because a caregiver who skips it is doing half the therapy —
+                  // but it is offered, not forced: nothing here blocks Start.
+                  OutlinedButton.icon(
+                    key: const Key('help_open_tapping_tutorial'),
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size.fromHeight(56),
+                      foregroundColor: AppColors.onCalm,
+                      side: const BorderSide(color: AppColors.accent),
+                    ),
+                    onPressed: () => Navigator.of(context).push(
+                      PortraitPageRoute<void>(
+                        builder: (_) => const TappingTutorialScreen(),
+                      ),
+                    ),
+                    icon: const Icon(Icons.back_hand_outlined),
+                    label: const Text('Learn the hand tapping'),
+                  ),
+                  const SizedBox(height: 12),
                   FilledButton(
                     style: FilledButton.styleFrom(
                       backgroundColor: AppColors.accent,

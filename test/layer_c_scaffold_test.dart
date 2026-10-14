@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rhythmic_practice/practice/mit_sequence.dart';
 import 'package:rhythmic_practice/data/models.dart';
 import 'package:rhythmic_practice/ml/graduation_gate.dart';
 import 'package:rhythmic_practice/ml/layer_c_classifier.dart';
@@ -81,7 +82,10 @@ void main() {
   group('Layer C classifier scaffold', () {
     test('untrained classifier always abstains (build, do not run)', () {
       const clf = UntrainedLayerC();
-      final f = LayerCFeatures(rung: 6, contentSimilarity: 0.95, tapSyncScore: 0.9);
+      final f = LayerCFeatures(
+          step: MitStep.probeQuestion,
+          contentSimilarity: 0.95,
+          tapSyncScore: 0.9);
       final p = clf.predict(f);
       expect(p.abstained, isTrue);
       expect(p.confidence, 0);
@@ -98,8 +102,7 @@ void main() {
         tappingSynchronizationScore: 0.8,
         evaluationLabel: 1,
         localEncryptedAudioPath: null,
-        rungAtAttempt: 6,
-        tierAtAttempt: 1,
+        stepAtAttempt: MitStep.probeQuestion.index,
         tempoBpm: 60,
       );
       const vector = FeatureVector(
@@ -119,17 +122,21 @@ void main() {
             attemptId: 'a1',
             phraseId: 1,
             sessionId: 's1',
-            rung: 6,
+            step: MitStep.probeQuestion,
             tapIndex: i,
             downMs: i * 500, // steady → CoV 0
             dwellMs: 100,
             beatPhase: null,
           ),
       ];
+      // The level is the session's, not the attempt row's — it is passed in.
       final f = LayerCFeatures.fromLoggedAttempt(
-          attempt: attempt, vector: vector, taps: taps);
-      expect(f.rung, 6);
-      expect(f.tier, 1);
+          attempt: attempt,
+          vector: vector,
+          taps: taps,
+          level: MitLevel.two);
+      expect(f.step, MitStep.probeQuestion);
+      expect(f.level, MitLevel.two);
       expect(f.tempoBpm, 60);
       expect(f.contentSimilarity, 0.9);
       expect(f.mfccDistance, 0.3);
@@ -139,7 +146,7 @@ void main() {
     });
 
     test('missing channels assemble to null, not a crash', () {
-      const attempt = ExerciseAttempt(
+      final attempt = ExerciseAttempt(
         attemptId: 'a2',
         sessionId: 's1',
         phraseId: 1,
@@ -149,14 +156,14 @@ void main() {
         tappingSynchronizationScore: null,
         evaluationLabel: 2,
         localEncryptedAudioPath: null,
-        rungAtAttempt: 2,
+        stepAtAttempt: MitStep.intoneUnison.index,
       );
       final f = LayerCFeatures.fromLoggedAttempt(attempt: attempt);
-      expect(f.rung, 2);
+      expect(f.step, MitStep.intoneUnison);
       expect(f.contentSimilarity, isNull);
       expect(f.itiCoefficientOfVariation, isNull);
       expect(f.onsetSteadiness, isNull);
-      expect(f.tier, isNull);
+      expect(f.level, isNull);
     });
   });
 }

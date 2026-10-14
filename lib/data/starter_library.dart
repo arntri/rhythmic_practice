@@ -52,6 +52,12 @@ class StarterPhrase {
 }
 
 /// The ~10 starter phrases. PLACEHOLDERS — see the file header.
+///
+/// **Only multisyllabic entries are on by default.** MIT intones a phrase on two
+/// pitches a minor third apart, one syllable per beat, so a one-syllable target
+/// has no contour at all — its hum is a single note. `Yes`, `No` and `Please`
+/// are shipped because a caregiver may want them, but they are off, and the
+/// choice to use them is a deliberate one.
 const List<StarterPhrase> starterLibrary = <StarterPhrase>[
   StarterPhrase(
     text: 'Water',
@@ -78,7 +84,6 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 0,
     nucleiMs: [200],
     assetPath: 'audio/starter/yes.wav',
-    activeByDefault: true,
   ),
   StarterPhrase(
     text: 'No',
@@ -87,7 +92,6 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 0,
     nucleiMs: [200],
     assetPath: 'audio/starter/no.wav',
-    activeByDefault: true,
   ),
   StarterPhrase(
     text: 'Please',
@@ -104,6 +108,7 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 0, // THANK-you
     nucleiMs: [150, 500],
     assetPath: 'audio/starter/thank_you.wav',
+    activeByDefault: true,
   ),
   StarterPhrase(
     text: 'Help me',
@@ -112,6 +117,7 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 0, // HELP-me
     nucleiMs: [150, 450],
     assetPath: 'audio/starter/help_me.wav',
+    activeByDefault: true,
   ),
   StarterPhrase(
     text: "I'm hungry",
@@ -120,6 +126,7 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 1, // I'm-HUN-gry
     nucleiMs: [150, 400, 650],
     assetPath: 'audio/starter/im_hungry.wav',
+    activeByDefault: true,
   ),
   StarterPhrase(
     text: "I'm tired",
@@ -128,6 +135,7 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 1, // I'm-TIRED
     nucleiMs: [150, 450],
     assetPath: 'audio/starter/im_tired.wav',
+    activeByDefault: true,
   ),
   StarterPhrase(
     text: 'Goodbye',
@@ -136,5 +144,6 @@ const List<StarterPhrase> starterLibrary = <StarterPhrase>[
     stressIndex: 1, // good-BYE
     nucleiMs: [150, 450],
     assetPath: 'audio/starter/goodbye.wav',
+    activeByDefault: true,
   ),
 ];

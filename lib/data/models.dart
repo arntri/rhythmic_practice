@@ -9,7 +9,7 @@
 
 import 'dart:typed_data';
 
-import '../practice/progression.dart';
+import '../practice/mit_sequence.dart';
 
 /// One row of the `practice_phrases` table: a phrase the user practices saying.
 class PracticePhrase {
@@ -35,17 +35,13 @@ class PracticePhrase {
   /// recorded + confirmed.
   final List<int> guideNucleiMs;
 
-  /// The MIT support/task ladder rung (therapy addendum §4) the caregiver has
-  /// this phrase on. Defaults to unison (R2).
-  final Rung rung;
-
   /// Path to an AES-encrypted photo for a "name card" (therapy addendum §6 —
   /// photo + recorded name). Null for an ordinary word/phrase.
   final String? photoPath;
 
-  /// The R7 probe question (audit item 11): the intoned/spoken question the app
-  /// plays for the user to answer with [phraseText], solo, at the top rung. Null
-  /// until the caregiver sets one — R7 then degrades to a gentle generic prompt.
+  /// The probe question (MIT's step 5): the intoned/spoken question the app
+  /// plays for the user to answer with [phraseText], solo. Null until the
+  /// caregiver sets one — the step then degrades to a gentle generic prompt.
   final String? probeQuestionText;
 
   /// AES-encrypted recorded probe question for R7. Null → the guide falls back to
@@ -83,7 +79,6 @@ class PracticePhrase {
     required this.audioAssetPath,
     this.guideClipPath,
     this.guideNucleiMs = const [],
-    this.rung = Rung.r2,
     this.photoPath,
     this.probeQuestionText,
     this.probeQuestionClipPath,
@@ -115,7 +110,6 @@ class PracticePhrase {
       guideNucleiMs: (nucleiCsv == null || nucleiCsv.isEmpty)
           ? const []
           : nucleiCsv.split(',').map(int.parse).toList(),
-      rung: rungFromLevel((row['current_rung'] as int?) ?? 2),
       photoPath: row['photo_path'] as String?,
       probeQuestionText: row['probe_question_text'] as String?,
       probeQuestionClipPath: row['probe_question_clip_path'] as String?,
@@ -194,12 +188,15 @@ class ExerciseAttempt {
   /// (Step 8), or until the mic (Step 5) records one.
   final String? localEncryptedAudioPath;
 
-  /// MIT rung this attempt was produced at (0–7); null pre-v8. Context for the
-  /// Layer C feature assembly (audit item 18).
-  final int? rungAtAttempt;
+  /// The MIT step this production was made at ([MitStep] index); null pre-v28
+  /// and for the rows of the old rung ladder. Context for the Layer C feature
+  /// assembly (audit item 18).
+  final int? stepAtAttempt;
 
-  /// Syllable tier at attempt time; null pre-v16.
-  final int? tierAtAttempt;
+  /// [stepAtAttempt] decoded, or null when the attempt predates v28.
+  MitStep? get step => stepAtAttempt == null
+      ? null
+      : MitStep.values[stepAtAttempt!.clamp(0, MitStep.values.length - 1)];
 
   /// Metronome tempo (BPM) this attempt was produced at; null pre-v20.
   final int? tempoBpm;
@@ -214,8 +211,7 @@ class ExerciseAttempt {
     required this.tappingSynchronizationScore,
     required this.evaluationLabel,
     required this.localEncryptedAudioPath,
-    this.rungAtAttempt,
-    this.tierAtAttempt,
+    this.stepAtAttempt,
     this.tempoBpm,
   });
 
@@ -231,8 +227,7 @@ class ExerciseAttempt {
           (row['tapping_synchronization_score'] as num?)?.toDouble(),
       evaluationLabel: row['evaluation_label'] as int,
       localEncryptedAudioPath: row['local_encrypted_audio_path'] as String?,
-      rungAtAttempt: row['rung_at_attempt'] as int?,
-      tierAtAttempt: row['tier_at_attempt'] as int?,
+      stepAtAttempt: row['step_at_attempt'] as int?,
       tempoBpm: row['tempo_bpm'] as int?,
     );
   }
@@ -317,8 +312,11 @@ class UserProfile {
   /// user speaks) before capture auto-closes. Caregiver-adjustable 3000–8000 ms.
   final int captureSilenceMs;
 
-  /// Whether the Phase 3 auto-progression engine may move phrases' rungs on
-  /// confirmed success/failure. When off, only the caregiver changes rungs.
+  /// Whether the app may raise the patient's [mitLevel] on its own once the
+  /// level criterion is met (90% of judged productions over ten sessions). When
+  /// off, only the caregiver changes the level. Note this is the ONLY thing
+  /// progression decides now — within a session the step sequence is fixed by
+  /// MIT and always runs in full.
   final bool autoProgressEnabled;
 
   /// Whether the first-run caregiver instructions have been shown.
@@ -331,16 +329,27 @@ class UserProfile {
   /// the spoken word come out slower (more elongation).
   final double playbackSpeed;
 
-  /// Caregiver "comfort cap" for low-energy days: the highest rung level (0–6)
-  /// the auto-progression may push a phrase to, or null for no cap. It only
-  /// limits *advancement* — it never demotes a phrase already above it — so it
-  /// can't trap the user lower. Cleared (back to null) when the caregiver lifts
-  /// the cap.
-  final int? sessionRungCap;
+  /// The PATIENT's MIT level (I/II/III), which selects the step sequence every
+  /// item runs. It belongs to the person, not to any word — that is what makes
+  /// the 90% criterion a level advancement rather than a per-word gate.
+  final MitLevel mitLevel;
+
+  /// The caregiver's practice goal, in MINUTES A DAY (default 60). What the
+  /// practice-dose view measures against, and stated on that screen rather than
+  /// implied by a full bar.
+  final int practiceTargetMinutes;
+
+  /// How grown the home-screen plant is (0–4), and the local day it last grew.
+  ///
+  /// The only progress the PATIENT ever sees, and it is a record of turning up,
+  /// not of doing well: it grows once per day practice happens, and nothing —
+  /// not a failed step, not a missed month — ever moves it back.
+  final int plantStage;
+  final String? plantGrownOn;
 
   /// Presenter "demo mode": when on, the practice screen shows an in-session
-  /// level picker so a live demo can jump the current word to any rung on demand.
-  /// Off by default; it only affects the in-session rung, never the stored
+  /// step picker so a live demo can jump to any step of the sequence on demand.
+  /// Off by default; it only affects the in-session run, never the stored
   /// progression — so demonstrating can't disturb real therapy history.
   final bool demoModeEnabled;
 
@@ -363,7 +372,10 @@ class UserProfile {
     this.onboardingSeen = false,
     this.targetDisplay = TargetDisplay.picture,
     this.playbackSpeed = 1.0,
-    this.sessionRungCap,
+    this.mitLevel = MitLevel.two,
+    this.practiceTargetMinutes = 60,
+    this.plantStage = 0,
+    this.plantGrownOn,
     this.demoModeEnabled = false,
     this.soloModeEnabled = false,
   });
@@ -383,7 +395,12 @@ class UserProfile {
       onboardingSeen: ((row['onboarding_seen'] as int?) ?? 0) == 1,
       targetDisplay: TargetDisplay.fromName(row['target_display'] as String?),
       playbackSpeed: (row['playback_speed'] as num?)?.toDouble() ?? 1.0,
-      sessionRungCap: row['session_rung_cap'] as int?,
+      mitLevel: MitLevel.values[((row['mit_level'] as int?) ?? 1)
+          .clamp(0, MitLevel.values.length - 1)],
+      practiceTargetMinutes:
+          ((row['practice_target_minutes'] as int?) ?? 60).clamp(10, 90),
+      plantStage: ((row['plant_stage'] as int?) ?? 0).clamp(0, 4),
+      plantGrownOn: row['plant_grown_on'] as String?,
       demoModeEnabled: ((row['demo_mode_enabled'] as int?) ?? 0) == 1,
       soloModeEnabled: ((row['solo_mode_enabled'] as int?) ?? 0) == 1,
     );
@@ -470,7 +487,7 @@ class AnchorTemplate {
 }
 
 /// One stored row of `tap_events` (ML logging audit item 16a): a single raw tap,
-/// tied to the attempt/phrase/rung it was made at. [downMs] is the monotonic
+/// tied to the attempt/phrase/step it was made at. [downMs] is the monotonic
 /// touch-down time (ms since the session's controller started), [dwellMs] the
 /// press duration (null if the finger-up was never observed), [beatPhase] the
 /// metronome phase at touch-down. The read side for the fatigue detector and
@@ -480,7 +497,9 @@ class StoredTapEvent {
   final String attemptId;
   final int phraseId;
   final String sessionId;
-  final int rung;
+  /// The MIT step this tap was made at, or null for a tap logged before v28 —
+  /// its rung number no longer decodes to anything, so it is not guessed at.
+  final MitStep? step;
   final int tapIndex;
   final int downMs;
   final int? dwellMs;
@@ -491,7 +510,7 @@ class StoredTapEvent {
     required this.attemptId,
     required this.phraseId,
     required this.sessionId,
-    required this.rung,
+    required this.step,
     required this.tapIndex,
     required this.downMs,
     required this.dwellMs,
@@ -503,7 +522,10 @@ class StoredTapEvent {
         attemptId: row['attempt_id'] as String,
         phraseId: row['phrase_id'] as int,
         sessionId: row['session_id'] as String,
-        rung: row['rung'] as int,
+        step: (row['step'] as int?) == null
+            ? null
+            : MitStep.values[(row['step'] as int)
+                .clamp(0, MitStep.values.length - 1)],
         tapIndex: row['tap_index'] as int,
         downMs: row['down_ms'] as int,
         dwellMs: row['dwell_ms'] as int?,

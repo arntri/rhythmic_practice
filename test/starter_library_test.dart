@@ -10,8 +10,6 @@ import 'package:rhythmic_practice/data/app_database.dart';
 import 'package:rhythmic_practice/data/models.dart';
 import 'package:rhythmic_practice/data/practice_repository.dart';
 import 'package:rhythmic_practice/data/starter_library.dart';
-import 'package:rhythmic_practice/practice/mit_progression.dart';
-import 'package:rhythmic_practice/practice/progression.dart';
 
 void main() {
   setUpAll(sqfliteFfiInit);
@@ -43,9 +41,12 @@ void main() {
           expect(s.stressIndex, inInclusiveRange(0, s.syllableCount - 1),
               reason: s.text);
         }
-        // Derived level matches the syllable-count mapping.
-        expect(s.complexityLevel, levelForSyllableCount(s.syllableCount),
-            reason: s.text);
+        // Complexity level tracks length: 1-3 syllables → 1, 4-6 → 2, 7+ → 3.
+        // (A local expectation now — the app no longer derives anything from
+        // syllable count, so there is no shared helper left to compare against.)
+        final expected =
+            s.syllableCount <= 3 ? 1 : (s.syllableCount <= 6 ? 2 : 3);
+        expect(s.complexityLevel, expected, reason: s.text);
       }
     });
   });
@@ -151,18 +152,68 @@ void main() {
     });
   });
 
+  group('the practice set is graded, and only contoured items are on', () {
+    test('the starter library and the seed list are disjoint', () {
+      // They both insert into practice_phrases on a fresh install, so an overlap
+      // is a duplicate phrase in the caregiver's library — which is exactly what
+      // used to happen with "Water".
+      final starters = {for (final s in starterLibrary) s.text};
+      final seeded = {for (final r in AppDatabase.seedPhrases) r[0] as String};
+      expect(starters.intersection(seeded), isEmpty);
+    });
+
+    test('nothing one-syllable is active by default, anywhere', () {
+      // MIT intones on two pitches, one syllable per beat. A one-syllable target
+      // has no contour at all — its hum is a single note — so opening a fresh
+      // install on monosyllables (which the seed used to do, four times over)
+      // means the therapy's melodic half barely engages.
+      for (final s in starterLibrary) {
+        if (s.syllableCount < 2) {
+          expect(s.activeByDefault, isFalse, reason: '\${s.text} has no contour');
+        }
+      }
+      for (final r in AppDatabase.seedPhrases) {
+        if ((r[2] as int) < 2) {
+          expect(r[3], 0, reason: '\${r[0]} has no contour');
+        }
+      }
+    });
+
+    test('something is on by default, and all of it has a contour', () {
+      final active = [
+        for (final s in starterLibrary)
+          if (s.activeByDefault) s,
+      ];
+      expect(active, isNotEmpty, reason: 'a first session needs phrases');
+      expect(active.every((s) => s.syllableCount >= 2), isTrue);
+    });
+
+    test('every length band exists, so Level III has something to practise', () {
+      // Level III's delayed repeat and Sprechgesang steps are for established,
+      // sentence-length material. Before the graded set, the longest phrase in
+      // the app was three syllables.
+      final counts = [
+        for (final s in starterLibrary) s.syllableCount,
+        for (final r in AppDatabase.seedPhrases) r[2] as int,
+      ];
+      expect(counts.any((c) => c >= 2 && c <= 3), isTrue, reason: 'short');
+      expect(counts.any((c) => c >= 4 && c <= 6), isTrue, reason: 'medium');
+      expect(counts.any((c) => c >= 7), isTrue, reason: 'sentence-length');
+    });
+  });
+
   group('is_starter never branches practice logic', () {
-    test('the progression engine advances a starter identically to any word',
+    test('the flag is presentation-only — nothing in the manifest carries it',
         () {
-      // A starter word and a plain word at the same rung with the same block get
-      // the same outcome — the engine has no is_starter input at all.
-      final engine = MitProgression();
-      const starterState = ProgressionState(profileId: 'p', phraseId: 1);
-      const plainState = ProgressionState(profileId: 'p', phraseId: 2);
-      final a = engine.evaluateBlock(starterState, [1, 1, 1]);
-      final b = engine.evaluateBlock(plainState, [1, 1, 1]);
-      expect(a.state.rung, b.state.rung);
-      expect(a.outcome, b.outcome);
+      // The starter flag exists to hide bundled words behind a "browse the
+      // library" affordance and to deprioritize them in a session. It has never
+      // been an input to how practice runs, and with the ladder gone there is no
+      // per-word progression state it could branch at all: every item runs the
+      // patient's level sequence in full, starter or not.
+      for (final s in starterLibrary) {
+        expect(s.text.trim(), isNotEmpty);
+        expect(s.syllableCount, greaterThan(0));
+      }
     });
   });
 }
